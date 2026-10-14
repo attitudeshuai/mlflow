@@ -23,6 +23,11 @@ from packaging.version import Version
 from urllib3.util.retry import Retry
 
 from mlflow.entities.webhook import Webhook, WebhookEvent, WebhookTestResult
+from mlflow.entities.webhook_delivery import (
+    WebhookDelivery,
+    WebhookDeliveryStatus,
+    WebhookDeliveryTrigger,
+)
 from mlflow.environment_variables import (
     MLFLOW_ENABLE_WORKSPACES,
     MLFLOW_WEBHOOK_CACHE_TTL,
@@ -33,11 +38,18 @@ from mlflow.environment_variables import (
 from mlflow.store.model_registry.abstract_store import AbstractStore
 from mlflow.store.model_registry.file_store import FileStore
 from mlflow.utils.validation import _validate_webhook_url
+from mlflow.webhooks.config import compute_next_retry_at, get_webhook_delivery_config
 from mlflow.webhooks.constants import (
     WEBHOOK_DELIVERY_ID_HEADER,
     WEBHOOK_SIGNATURE_HEADER,
     WEBHOOK_SIGNATURE_VERSION,
     WEBHOOK_TIMESTAMP_HEADER,
+)
+from mlflow.webhooks.records import (
+    RecordingRetry,
+    _AttemptRecorder,
+    summarize_payload,
+    summary_to_payload,
 )
 from mlflow.webhooks.ssrf import SSRFProtectedHTTPAdapter
 from mlflow.webhooks.types import (
@@ -158,36 +170,9 @@ def _send_webhook_request(
     """
     _validate_webhook_url(webhook.url)
 
-    # Create webhook payload with metadata
-    webhook_payload = {
-        "entity": event.entity.value,
-        "action": event.action.value,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "data": payload,
-    }
-    if MLFLOW_ENABLE_WORKSPACES.get():
-        webhook_payload["workspace"] = webhook.workspace
-
-    payload_json = json.dumps(webhook_payload)
-    payload_bytes = payload_json.encode("utf-8")
-
-    # Generate IDs and timestamps for webhooks
-    delivery_id = str(uuid.uuid4())
-    unix_timestamp = str(int(time.time()))
-
-    # MLflow webhook headers
-    headers = {
-        "Content-Type": "application/json",
-        WEBHOOK_DELIVERY_ID_HEADER: delivery_id,
-        WEBHOOK_TIMESTAMP_HEADER: unix_timestamp,
-    }
-
-    # Add signature if secret is configured
-    if webhook.secret:
-        signature = _generate_hmac_signature(
-            webhook.secret, delivery_id, unix_timestamp, payload_json
-        )
-        headers[WEBHOOK_SIGNATURE_HEADER] = signature
+    delivery_id, payload_bytes, headers = _build_webhook_request(
+        webhook, payload, event
+    )
 
     timeout = MLFLOW_WEBHOOK_REQUEST_TIMEOUT.get()
 
@@ -202,6 +187,218 @@ def _send_webhook_request(
         # Other request errors
         _logger.error(f"Webhook request to {webhook.url} failed: {e}")
         raise
+
+
+def _build_webhook_request(
+    webhook: Webhook,
+    payload: WebhookPayload,
+    event: WebhookEvent,
+    delivery_id: str | None = None,
+) -> tuple[str, bytes, dict[str, str]]:
+    """Build the delivery id, serialized envelope and signed headers.
+
+    When ``delivery_id`` is provided it is used both as the persisted record
+    identifier and as the ``X-MLflow-Delivery-Id`` header value (redeliveries
+    always generate a fresh id).
+    """
+    # Create webhook payload with metadata
+    webhook_payload = {
+        "entity": event.entity.value,
+        "action": event.action.value,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "data": payload,
+    }
+    if MLFLOW_ENABLE_WORKSPACES.get():
+        webhook_payload["workspace"] = webhook.workspace
+
+    payload_json = json.dumps(webhook_payload)
+    payload_bytes = payload_json.encode("utf-8")
+
+    # Generate IDs and timestamps for webhooks
+    delivery_id = delivery_id or str(uuid.uuid4())
+    unix_timestamp = str(int(time.time()))
+
+    # MLflow webhook headers
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        WEBHOOK_DELIVERY_ID_HEADER: delivery_id,
+        WEBHOOK_TIMESTAMP_HEADER: unix_timestamp,
+    }
+
+    # Add signature if secret is configured
+    if webhook.secret:
+        signature = _generate_hmac_signature(
+            webhook.secret, delivery_id, unix_timestamp, payload_json
+        )
+        headers[WEBHOOK_SIGNATURE_HEADER] = signature
+
+    return delivery_id, payload_bytes, headers
+
+
+def _create_recording_webhook_session(attempt_callback) -> requests.Session:
+    """Create a session whose urllib3 Retry reports every attempt."""
+    max_retries = MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES.get()
+    retry_kwargs = {}
+    if Version(urllib3.__version__) >= Version("2.0"):
+        retry_kwargs["backoff_jitter"] = 1.0
+    retry_strategy = RecordingRetry(
+        total=max_retries,
+        status=max_retries,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST"],
+        backoff_factor=1.0,
+        backoff_max=60.0,
+        respect_retry_after_header=True,
+        raise_on_status=False,
+        attempt_callback=attempt_callback,
+        **retry_kwargs,
+    )
+    session = requests.Session()
+    adapter = SSRFProtectedHTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.trust_env = False
+    return session
+
+
+def _send_tracked_webhook(
+    webhook: Webhook,
+    event: WebhookEvent,
+    payload: WebhookPayload,
+    store: AbstractStore,
+    *,
+    trigger: WebhookDeliveryTrigger,
+    delivery_id: str | None = None,
+    root_delivery_id: str | None = None,
+    parent_delivery_id: str | None = None,
+    redelivery_count: int = 0,
+) -> WebhookDelivery | None:
+    """Send one delivery while persisting its record and attempt rows.
+
+    Used on worker threads when delivery recording is enabled. Any record-store
+    failure degrades to an error log and never affects the HTTP delivery.
+    Returns the created (PENDING) record entity, or ``None`` if record creation
+    itself failed.
+    """
+    config = get_webhook_delivery_config()
+    workspace = webhook.workspace
+    delivery_id = delivery_id or str(uuid.uuid4())
+    # Initial deliveries send the original event payload; redeliveries pass the
+    # parsed identifier-only summary as ``payload`` and resend that.
+    request_data = payload
+    payload_summary = summarize_payload(payload)
+
+    recorder = _AttemptRecorder(store, delivery_id, workspace)
+
+    record: WebhookDelivery | None = None
+    try:
+        record = store.create_webhook_delivery(
+            delivery_id=delivery_id,
+            webhook_id=webhook.webhook_id,
+            webhook_name=webhook.name,
+            webhook_url=webhook.url,
+            event=event,
+            payload_summary=payload_summary,
+            trigger=trigger,
+            root_delivery_id=root_delivery_id,
+            parent_delivery_id=parent_delivery_id,
+            redelivery_count=redelivery_count,
+            workspace=workspace,
+        )
+    except Exception:
+        _logger.error(
+            "Failed to create webhook delivery record for delivery %s; "
+            "proceeding with delivery without recording",
+            delivery_id,
+            exc_info=True,
+        )
+
+    final_status = WebhookDeliveryStatus.FAILURE
+    failure_reason: str | None = None
+    try:
+        _validate_webhook_url(webhook.url)
+        _, payload_bytes, headers = _build_webhook_request(
+            webhook, request_data, event, delivery_id
+        )
+        session = _create_recording_webhook_session(recorder.record_retry_hook)
+        timeout = MLFLOW_WEBHOOK_REQUEST_TIMEOUT.get()
+        try:
+            response = session.post(
+                webhook.url, data=payload_bytes, headers=headers, timeout=timeout
+            )
+        except requests.RequestException as e:
+            recorder.record_final_exception(e)
+            failure_reason = str(e) or repr(e)
+            _logger.error(f"Webhook request to {webhook.url} failed: {e}")
+        else:
+            recorder.record_final_response(response)
+            if response.status_code < 400:
+                final_status = WebhookDeliveryStatus.SUCCESS
+            else:
+                failure_reason = recorder.last_error_message or (
+                    f"Received HTTP {response.status_code} response"
+                )
+    except Exception as e:
+        # Includes validation errors and non-urllib3 connection errors (e.g.
+        # SSRF protection), which are not retried and propagate immediately.
+        recorder.record_final_exception(e)
+        failure_reason = str(e) or repr(e)
+        _logger.error(
+            f"Failed to send webhook to {webhook.url} for event {event}: {e}",
+            exc_info=True,
+        )
+
+    if record is None:
+        return None
+
+    try:
+        store.complete_webhook_delivery(
+            delivery_id=delivery_id,
+            status=final_status,
+            completed_timestamp=int(time.time() * 1000),
+            failure_reason=failure_reason,
+            workspace=workspace,
+        )
+    except Exception:
+        _logger.error(
+            "Failed to persist final status %s for delivery %s",
+            final_status,
+            delivery_id,
+            exc_info=True,
+        )
+
+    if (
+        final_status == WebhookDeliveryStatus.FAILURE
+        and config.automatic_redelivery_active
+        and redelivery_count < config.redelivery_max_attempts
+    ):
+        next_retry_at = compute_next_retry_at(
+            int(time.time() * 1000),
+            redelivery_count,
+            config.redelivery_interval_seconds,
+            config.redelivery_backoff,
+        )
+        try:
+            store.schedule_webhook_delivery_retry(
+                delivery_id=delivery_id,
+                next_retry_at=next_retry_at,
+                workspace=workspace,
+            )
+        except Exception:
+            _logger.error(
+                "Failed to schedule automatic redelivery for %s",
+                delivery_id,
+                exc_info=True,
+            )
+
+    try:
+        store.prune_webhook_deliveries(config.record_retention, workspace=workspace)
+    except Exception:
+        _logger.error(
+            "Failed to prune webhook delivery records", exc_info=True
+        )
+
+    return record
 
 
 def _get_or_create_webhook_cache(ttl_seconds: int) -> TTLCache[WebhookEvent, list[Webhook]]:

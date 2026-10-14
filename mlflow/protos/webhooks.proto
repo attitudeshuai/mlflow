@@ -113,6 +113,57 @@ service WebhookService {
       rpc_doc_title: "Test Webhook"
     };
   }
+
+  rpc listWebhookDeliveries(ListWebhookDeliveries) returns (ListWebhookDeliveries.Response) {
+    option (rpc) = {
+      endpoints: [
+        {
+          method: "GET"
+          path: "/mlflow/webhooks/deliveries"
+          since: {
+            major: 2
+            minor: 0
+          }
+        }
+      ]
+      visibility: PUBLIC
+      rpc_doc_title: "List Webhook Deliveries"
+    };
+  }
+
+  rpc getWebhookDelivery(GetWebhookDelivery) returns (GetWebhookDelivery.Response) {
+    option (rpc) = {
+      endpoints: [
+        {
+          method: "GET"
+          path: "/mlflow/webhooks/deliveries/{delivery_id}"
+          since: {
+            major: 2
+            minor: 0
+          }
+        }
+      ]
+      visibility: PUBLIC
+      rpc_doc_title: "Get Webhook Delivery"
+    };
+  }
+
+  rpc redeliverWebhookDelivery(RedeliverWebhookDelivery) returns (RedeliverWebhookDelivery.Response) {
+    option (rpc) = {
+      endpoints: [
+        {
+          method: "POST"
+          path: "/mlflow/webhooks/deliveries/{delivery_id}/redeliver"
+          since: {
+            major: 2
+            minor: 0
+          }
+        }
+      ]
+      visibility: PUBLIC
+      rpc_doc_title: "Redeliver Webhook Delivery"
+    };
+  }
 }
 
 // Webhook status enumeration
@@ -310,5 +361,175 @@ message TestWebhook {
 
   message Response {
     optional WebhookTestResult result = 1;
+  }
+}
+
+// Delivery status: PENDING while the HTTP attempts are in flight, SUCCESS once
+// the target accepted (HTTP < 400), FAILURE after all attempts were rejected
+// or raised.
+enum WebhookDeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0; // Default/unknown status
+  PENDING = 1; // Delivery attempts still in flight
+  SUCCESS = 2; // Target returned a success status (HTTP < 400)
+  FAILURE = 3; // All attempts failed
+}
+
+// What triggered the delivery: the original event, a manual redelivery, or the
+// automatic redelivery policy.
+enum WebhookDeliveryTrigger {
+  DELIVERY_TRIGGER_UNSPECIFIED = 0; // Default/unknown trigger
+  INITIAL = 1; // Original event delivery
+  MANUAL = 2; // Manually requested redelivery
+  AUTOMATIC = 3; // Policy-driven automatic redelivery
+}
+
+// Result of a single HTTP attempt within a delivery.
+enum WebhookDeliveryAttemptResult {
+  ATTEMPT_RESULT_UNSPECIFIED = 0; // Default/unknown result
+  ATTEMPT_SUCCESS = 1; // Attempt returned HTTP < 400
+  HTTP_ERROR = 2; // Attempt returned HTTP >= 400
+  REQUEST_ERROR = 3; // Attempt raised a request exception (timeout, connection error, ...)
+}
+
+// A single HTTP attempt record within a webhook delivery.
+message WebhookDeliveryAttempt {
+  // Sequence number of the attempt within the delivery, starting at 1
+  optional int32 attempt_number = 1;
+
+  // Timestamp (milliseconds since epoch) when the attempt started
+  optional int64 started_timestamp = 2;
+
+  // Timestamp (milliseconds since epoch) when the attempt finished
+  optional int64 completed_timestamp = 3;
+
+  // Outcome of the attempt
+  optional WebhookDeliveryAttemptResult result = 4;
+
+  // HTTP status code returned by the target, when a response was received
+  optional int32 http_status = 5;
+
+  // Exception class name when the attempt raised
+  optional string error_type = 6;
+
+  // Human-readable failure detail for the attempt
+  optional string error_message = 7;
+}
+
+// Persisted record of one webhook delivery (one event sent to one subscribed
+// webhook). Redeliveries create new records linked through
+// root/parent delivery ids.
+message WebhookDelivery {
+  // Unique delivery identifier; also sent as the X-MLflow-Delivery-Id header
+  optional string delivery_id = 1;
+
+  // ID of the target subscription at delivery time
+  optional string webhook_id = 2;
+
+  // Snapshot of the subscription name at delivery time
+  optional string webhook_name = 3;
+
+  // Snapshot of the subscription URL at delivery time
+  optional string webhook_url = 4;
+
+  // Event entity that triggered the delivery
+  optional WebhookEntity entity = 5;
+
+  // Event action that triggered the delivery
+  optional WebhookAction action = 6;
+
+  // Identifier-only JSON summary of the event payload (full content is not retained)
+  optional string payload_summary = 7;
+
+  // Final conclusion of the delivery
+  optional WebhookDeliveryStatus status = 8;
+
+  // What triggered this delivery
+  optional WebhookDeliveryTrigger trigger = 9;
+
+  // Delivery id of the first delivery in the redelivery chain (equals
+  // delivery_id for initial deliveries)
+  optional string root_delivery_id = 10;
+
+  // Delivery id of the delivery this one redelivered (unset for INITIAL)
+  optional string parent_delivery_id = 11;
+
+  // Redelivery generation along the chain (0 for the initial delivery)
+  optional int32 redelivery_count = 12;
+
+  // Failure reason of the final attempt when status is FAILURE
+  optional string failure_reason = 13;
+
+  // Timestamp when the record was created
+  optional int64 creation_timestamp = 14;
+
+  // Timestamp when the delivery reached its final status
+  optional int64 completed_timestamp = 15;
+
+  // One record per HTTP attempt (including in-request retries), ordered by attempt number
+  repeated WebhookDeliveryAttempt attempts = 16;
+
+  // Workspace the target subscription belongs to
+  optional string workspace = 17;
+}
+
+// List webhook deliveries request
+message ListWebhookDeliveries {
+  option (scalapb.message).extends = "com.databricks.rpc.RPC[$this.Response]";
+
+  // Filter by subscription id
+  optional string webhook_id = 1;
+
+  // Filter by event entity
+  optional WebhookEntity entity = 2;
+
+  // Filter by event action
+  optional WebhookAction action = 3;
+
+  // Filter by final delivery status
+  optional WebhookDeliveryStatus status = 4;
+
+  // Only return records created at or after this timestamp (milliseconds since epoch)
+  optional int64 start_timestamp = 5;
+
+  // Only return records created at or before this timestamp (milliseconds since epoch)
+  optional int64 end_timestamp = 6;
+
+  // Maximum number of deliveries to return
+  optional int32 max_results = 7 [default = 100];
+
+  // Pagination token from previous request
+  optional string page_token = 8;
+
+  message Response {
+    // List of webhook deliveries
+    repeated WebhookDelivery deliveries = 1;
+
+    // Pagination token for next page
+    optional string next_page_token = 2;
+  }
+}
+
+// Get webhook delivery request
+message GetWebhookDelivery {
+  option (scalapb.message).extends = "com.databricks.rpc.RPC[$this.Response]";
+
+  // ID of the delivery to retrieve
+  optional string delivery_id = 1 [(validate_required) = true];
+
+  message Response {
+    optional WebhookDelivery delivery = 1;
+  }
+}
+
+// Redeliver a failed webhook delivery
+message RedeliverWebhookDelivery {
+  option (scalapb.message).extends = "com.databricks.rpc.RPC[$this.Response]";
+
+  // ID of the failed delivery to redeliver
+  optional string delivery_id = 1 [(validate_required) = true];
+
+  message Response {
+    // The newly created delivery record (status PENDING)
+    optional WebhookDelivery delivery = 1;
   }
 }

@@ -546,6 +546,343 @@ class TestWebhook(_message.Message):
 
 Global___TestWebhook: _TypeAlias = TestWebhook  # noqa: Y015
 
+class _WebhookDeliveryStatus:
+    ValueType = _typing.NewType("ValueType", _builtins.int)
+    V: _TypeAlias = ValueType  # noqa: Y015
+
+class _WebhookDeliveryStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_WebhookDeliveryStatus.ValueType], _builtins.type):
+    DESCRIPTOR: _descriptor.EnumDescriptor
+    DELIVERY_STATUS_UNSPECIFIED: _WebhookDeliveryStatus.ValueType  # 0
+    PENDING: _WebhookDeliveryStatus.ValueType  # 1
+    """Delivery attempts still in flight"""
+    SUCCESS: _WebhookDeliveryStatus.ValueType  # 2
+    """Target returned a success status (HTTP < 400)"""
+    FAILURE: _WebhookDeliveryStatus.ValueType  # 3
+    """All attempts failed"""
+
+class WebhookDeliveryStatus(_WebhookDeliveryStatus, metaclass=_WebhookDeliveryStatusEnumTypeWrapper):
+    """Delivery status for a webhook delivery"""
+
+DELIVERY_STATUS_UNSPECIFIED: WebhookDeliveryStatus.ValueType  # 0
+PENDING: WebhookDeliveryStatus.ValueType  # 1
+"""Delivery attempts still in flight"""
+SUCCESS: WebhookDeliveryStatus.ValueType  # 2
+"""Target returned a success status (HTTP < 400)"""
+FAILURE: WebhookDeliveryStatus.ValueType  # 3
+"""All attempts failed"""
+Global___WebhookDeliveryStatus: _TypeAlias = WebhookDeliveryStatus  # noqa: Y015
+
+class _WebhookDeliveryTrigger:
+    ValueType = _typing.NewType("ValueType", _builtins.int)
+    V: _TypeAlias = ValueType  # noqa: Y015
+
+class _WebhookDeliveryTriggerEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_WebhookDeliveryTrigger.ValueType], _builtins.type):
+    DESCRIPTOR: _descriptor.EnumDescriptor
+    DELIVERY_TRIGGER_UNSPECIFIED: _WebhookDeliveryTrigger.ValueType  # 0
+    INITIAL: _WebhookDeliveryTrigger.ValueType  # 1
+    """Original event delivery"""
+    MANUAL: _WebhookDeliveryTrigger.ValueType  # 2
+    """Manually requested redelivery"""
+    AUTOMATIC: _WebhookDeliveryTrigger.ValueType  # 3
+    """Policy-driven automatic redelivery"""
+
+class WebhookDeliveryTrigger(_WebhookDeliveryTrigger, metaclass=_WebhookDeliveryTriggerEnumTypeWrapper):
+    """What triggered a webhook delivery"""
+
+DELIVERY_TRIGGER_UNSPECIFIED: WebhookDeliveryTrigger.ValueType  # 0
+INITIAL: WebhookDeliveryTrigger.ValueType  # 1
+"""Original event delivery"""
+MANUAL: WebhookDeliveryTrigger.ValueType  # 2
+"""Manually requested redelivery"""
+AUTOMATIC: WebhookDeliveryTrigger.ValueType  # 3
+"""Policy-driven automatic redelivery"""
+Global___WebhookDeliveryTrigger: _TypeAlias = WebhookDeliveryTrigger  # noqa: Y015
+
+class _WebhookDeliveryAttemptResult:
+    ValueType = _typing.NewType("ValueType", _builtins.int)
+    V: _TypeAlias = ValueType  # noqa: Y015
+
+class _WebhookDeliveryAttemptResultEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_WebhookDeliveryAttemptResult.ValueType], _builtins.type):
+    DESCRIPTOR: _descriptor.EnumDescriptor
+    ATTEMPT_RESULT_UNSPECIFIED: _WebhookDeliveryAttemptResult.ValueType  # 0
+    ATTEMPT_SUCCESS: _WebhookDeliveryAttemptResult.ValueType  # 1
+    """Attempt returned HTTP < 400"""
+    HTTP_ERROR: _WebhookDeliveryAttemptResult.ValueType  # 2
+    """Attempt returned HTTP >= 400"""
+    REQUEST_ERROR: _WebhookDeliveryAttemptResult.ValueType  # 3
+    """Attempt raised a request exception"""
+
+class WebhookDeliveryAttemptResult(_WebhookDeliveryAttemptResult, metaclass=_WebhookDeliveryAttemptResultEnumTypeWrapper):
+    """Result of a single HTTP attempt within a delivery"""
+
+ATTEMPT_RESULT_UNSPECIFIED: WebhookDeliveryAttemptResult.ValueType  # 0
+ATTEMPT_SUCCESS: WebhookDeliveryAttemptResult.ValueType  # 1
+"""Attempt returned HTTP < 400"""
+HTTP_ERROR: WebhookDeliveryAttemptResult.ValueType  # 2
+"""Attempt returned HTTP >= 400"""
+REQUEST_ERROR: WebhookDeliveryAttemptResult.ValueType  # 3
+"""Attempt raised a request exception"""
+Global___WebhookDeliveryAttemptResult: _TypeAlias = WebhookDeliveryAttemptResult  # noqa: Y015
+
+@_typing.final
+class WebhookDeliveryAttempt(_message.Message):
+    """A single HTTP attempt record within a webhook delivery"""
+
+    DESCRIPTOR: _descriptor.Descriptor
+
+    ATTEMPT_NUMBER_FIELD_NUMBER: _builtins.int
+    STARTED_TIMESTAMP_FIELD_NUMBER: _builtins.int
+    COMPLETED_TIMESTAMP_FIELD_NUMBER: _builtins.int
+    RESULT_FIELD_NUMBER: _builtins.int
+    HTTP_STATUS_FIELD_NUMBER: _builtins.int
+    ERROR_TYPE_FIELD_NUMBER: _builtins.int
+    ERROR_MESSAGE_FIELD_NUMBER: _builtins.int
+    attempt_number: _builtins.int
+    """Sequence number within the delivery, starting at 1"""
+    started_timestamp: _builtins.int
+    """Timestamp (ms) when the attempt started"""
+    completed_timestamp: _builtins.int
+    """Timestamp (ms) when the attempt finished"""
+    result: Global___WebhookDeliveryAttemptResult.ValueType
+    """Outcome of the attempt"""
+    http_status: _builtins.int
+    """HTTP status code, when a response was received"""
+    error_type: _builtins.str
+    """Exception class name when the attempt raised"""
+    error_message: _builtins.str
+    """Human-readable failure detail"""
+    def __init__(
+        self,
+        *,
+        attempt_number: _builtins.int | None = ...,
+        started_timestamp: _builtins.int | None = ...,
+        completed_timestamp: _builtins.int | None = ...,
+        result: Global___WebhookDeliveryAttemptResult.ValueType | None = ...,
+        http_status: _builtins.int | None = ...,
+        error_type: _builtins.str | None = ...,
+        error_message: _builtins.str | None = ...,
+    ) -> None: ...
+    _HasFieldArgType: _TypeAlias = _typing.Literal["attempt_number", b"attempt_number", "completed_timestamp", b"completed_timestamp", "error_message", b"error_message", "error_type", b"error_type", "http_status", b"http_status", "result", b"result", "started_timestamp", b"started_timestamp"]  # noqa: Y015
+    def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["attempt_number", b"attempt_number", "completed_timestamp", b"completed_timestamp", "error_message", b"error_message", "error_type", b"error_type", "http_status", b"http_status", "result", b"result", "started_timestamp", b"started_timestamp"]  # noqa: Y015
+    def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    def WhichOneof(self, oneof_group: _Never) -> None: ...
+
+Global___WebhookDeliveryAttempt: _TypeAlias = WebhookDeliveryAttempt  # noqa: Y015
+
+@_typing.final
+class WebhookDelivery(_message.Message):
+    """Persisted record of one webhook delivery"""
+
+    DESCRIPTOR: _descriptor.Descriptor
+
+    DELIVERY_ID_FIELD_NUMBER: _builtins.int
+    WEBHOOK_ID_FIELD_NUMBER: _builtins.int
+    WEBHOOK_NAME_FIELD_NUMBER: _builtins.int
+    WEBHOOK_URL_FIELD_NUMBER: _builtins.int
+    ENTITY_FIELD_NUMBER: _builtins.int
+    ACTION_FIELD_NUMBER: _builtins.int
+    PAYLOAD_SUMMARY_FIELD_NUMBER: _builtins.int
+    STATUS_FIELD_NUMBER: _builtins.int
+    TRIGGER_FIELD_NUMBER: _builtins.int
+    ROOT_DELIVERY_ID_FIELD_NUMBER: _builtins.int
+    PARENT_DELIVERY_ID_FIELD_NUMBER: _builtins.int
+    REDELIVERY_COUNT_FIELD_NUMBER: _builtins.int
+    FAILURE_REASON_FIELD_NUMBER: _builtins.int
+    CREATION_TIMESTAMP_FIELD_NUMBER: _builtins.int
+    COMPLETED_TIMESTAMP_FIELD_NUMBER: _builtins.int
+    ATTEMPTS_FIELD_NUMBER: _builtins.int
+    WORKSPACE_FIELD_NUMBER: _builtins.int
+    delivery_id: _builtins.str
+    webhook_id: _builtins.str
+    webhook_name: _builtins.str
+    webhook_url: _builtins.str
+    entity: Global___WebhookEntity.ValueType
+    action: Global___WebhookAction.ValueType
+    payload_summary: _builtins.str
+    status: Global___WebhookDeliveryStatus.ValueType
+    trigger: Global___WebhookDeliveryTrigger.ValueType
+    root_delivery_id: _builtins.str
+    parent_delivery_id: _builtins.str
+    redelivery_count: _builtins.int
+    failure_reason: _builtins.str
+    creation_timestamp: _builtins.int
+    completed_timestamp: _builtins.int
+    workspace: _builtins.str
+    @_builtins.property
+    def attempts(self) -> _containers.RepeatedCompositeFieldContainer[Global___WebhookDeliveryAttempt]: ...
+
+    def __init__(
+        self,
+        *,
+        delivery_id: _builtins.str | None = ...,
+        webhook_id: _builtins.str | None = ...,
+        webhook_name: _builtins.str | None = ...,
+        webhook_url: _builtins.str | None = ...,
+        entity: Global___WebhookEntity.ValueType | None = ...,
+        action: Global___WebhookAction.ValueType | None = ...,
+        payload_summary: _builtins.str | None = ...,
+        status: Global___WebhookDeliveryStatus.ValueType | None = ...,
+        trigger: Global___WebhookDeliveryTrigger.ValueType | None = ...,
+        root_delivery_id: _builtins.str | None = ...,
+        parent_delivery_id: _builtins.str | None = ...,
+        redelivery_count: _builtins.int | None = ...,
+        failure_reason: _builtins.str | None = ...,
+        creation_timestamp: _builtins.int | None = ...,
+        completed_timestamp: _builtins.int | None = ...,
+        attempts: _abc.Iterable[Global___WebhookDeliveryAttempt] | None = ...,
+        workspace: _builtins.str | None = ...,
+    ) -> None: ...
+    _HasFieldArgType: _TypeAlias = _typing.Literal["action", b"action", "completed_timestamp", b"completed_timestamp", "creation_timestamp", b"creation_timestamp", "delivery_id", b"delivery_id", "entity", b"entity", "failure_reason", b"failure_reason", "parent_delivery_id", b"parent_delivery_id", "payload_summary", b"payload_summary", "redelivery_count", b"redelivery_count", "root_delivery_id", b"root_delivery_id", "status", b"status", "trigger", b"trigger", "webhook_id", b"webhook_id", "webhook_name", b"webhook_name", "webhook_url", b"webhook_url", "workspace", b"workspace"]  # noqa: Y015
+    def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["action", b"action", "completed_timestamp", b"completed_timestamp", "creation_timestamp", b"creation_timestamp", "delivery_id", b"delivery_id", "entity", b"entity", "failure_reason", b"failure_reason", "parent_delivery_id", b"parent_delivery_id", "payload_summary", b"payload_summary", "redelivery_count", b"redelivery_count", "root_delivery_id", b"root_delivery_id", "status", b"status", "trigger", b"trigger", "webhook_id", b"webhook_id", "webhook_name", b"webhook_name", "webhook_url", b"webhook_url", "workspace", b"workspace"]  # noqa: Y015
+    def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    def WhichOneof(self, oneof_group: _Never) -> None: ...
+
+Global___WebhookDelivery: _TypeAlias = WebhookDelivery  # noqa: Y015
+
+@_typing.final
+class ListWebhookDeliveries(_message.Message):
+    """List webhook deliveries request"""
+
+    DESCRIPTOR: _descriptor.Descriptor
+
+    @_typing.final
+    class Response(_message.Message):
+        DESCRIPTOR: _descriptor.Descriptor
+
+        DELIVERIES_FIELD_NUMBER: _builtins.int
+        NEXT_PAGE_TOKEN_FIELD_NUMBER: _builtins.int
+        next_page_token: _builtins.str
+        @_builtins.property
+        def deliveries(self) -> _containers.RepeatedCompositeFieldContainer[Global___WebhookDelivery]: ...
+
+        def __init__(
+            self,
+            *,
+            deliveries: _abc.Iterable[Global___WebhookDelivery] | None = ...,
+            next_page_token: _builtins.str | None = ...,
+        ) -> None: ...
+        _HasFieldArgType: _TypeAlias = _typing.Literal["next_page_token", b"next_page_token"]  # noqa: Y015
+        def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+        _ClearFieldArgType: _TypeAlias = _typing.Literal["deliveries", b"deliveries", "next_page_token", b"next_page_token"]  # noqa: Y015
+        def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+        def WhichOneof(self, oneof_group: _Never) -> None: ...
+
+    WEBHOOK_ID_FIELD_NUMBER: _builtins.int
+    ENTITY_FIELD_NUMBER: _builtins.int
+    ACTION_FIELD_NUMBER: _builtins.int
+    STATUS_FIELD_NUMBER: _builtins.int
+    START_TIMESTAMP_FIELD_NUMBER: _builtins.int
+    END_TIMESTAMP_FIELD_NUMBER: _builtins.int
+    MAX_RESULTS_FIELD_NUMBER: _builtins.int
+    PAGE_TOKEN_FIELD_NUMBER: _builtins.int
+    webhook_id: _builtins.str
+    entity: Global___WebhookEntity.ValueType
+    action: Global___WebhookAction.ValueType
+    status: Global___WebhookDeliveryStatus.ValueType
+    start_timestamp: _builtins.int
+    end_timestamp: _builtins.int
+    max_results: _builtins.int
+    page_token: _builtins.str
+    def __init__(
+        self,
+        *,
+        webhook_id: _builtins.str | None = ...,
+        entity: Global___WebhookEntity.ValueType | None = ...,
+        action: Global___WebhookAction.ValueType | None = ...,
+        status: Global___WebhookDeliveryStatus.ValueType | None = ...,
+        start_timestamp: _builtins.int | None = ...,
+        end_timestamp: _builtins.int | None = ...,
+        max_results: _builtins.int | None = ...,
+        page_token: _builtins.str | None = ...,
+    ) -> None: ...
+    _HasFieldArgType: _TypeAlias = _typing.Literal["action", b"action", "end_timestamp", b"end_timestamp", "entity", b"entity", "max_results", b"max_results", "page_token", b"page_token", "start_timestamp", b"start_timestamp", "status", b"status", "webhook_id", b"webhook_id"]  # noqa: Y015
+    def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["action", b"action", "end_timestamp", b"end_timestamp", "entity", b"entity", "max_results", b"max_results", "page_token", b"page_token", "start_timestamp", b"start_timestamp", "status", b"status", "webhook_id", b"webhook_id"]  # noqa: Y015
+    def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    def WhichOneof(self, oneof_group: _Never) -> None: ...
+
+Global___ListWebhookDeliveries: _TypeAlias = ListWebhookDeliveries  # noqa: Y015
+
+@_typing.final
+class GetWebhookDelivery(_message.Message):
+    """Get webhook delivery request"""
+
+    DESCRIPTOR: _descriptor.Descriptor
+
+    @_typing.final
+    class Response(_message.Message):
+        DESCRIPTOR: _descriptor.Descriptor
+
+        DELIVERY_FIELD_NUMBER: _builtins.int
+        @_builtins.property
+        def delivery(self) -> Global___WebhookDelivery: ...
+        def __init__(
+            self,
+            *,
+            delivery: Global___WebhookDelivery | None = ...,
+        ) -> None: ...
+        _HasFieldArgType: _TypeAlias = _typing.Literal["delivery", b"delivery"]  # noqa: Y015
+        def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+        _ClearFieldArgType: _TypeAlias = _typing.Literal["delivery", b"delivery"]  # noqa: Y015
+        def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+        def WhichOneof(self, oneof_group: _Never) -> None: ...
+
+    DELIVERY_ID_FIELD_NUMBER: _builtins.int
+    delivery_id: _builtins.str
+    def __init__(
+        self,
+        *,
+        delivery_id: _builtins.str | None = ...,
+    ) -> None: ...
+    _HasFieldArgType: _TypeAlias = _typing.Literal["delivery_id", b"delivery_id"]  # noqa: Y015
+    def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["delivery_id", b"delivery_id"]  # noqa: Y015
+    def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    def WhichOneof(self, oneof_group: _Never) -> None: ...
+
+Global___GetWebhookDelivery: _TypeAlias = GetWebhookDelivery  # noqa: Y015
+
+@_typing.final
+class RedeliverWebhookDelivery(_message.Message):
+    """Redeliver a failed webhook delivery"""
+
+    DESCRIPTOR: _descriptor.Descriptor
+
+    @_typing.final
+    class Response(_message.Message):
+        DESCRIPTOR: _descriptor.Descriptor
+
+        DELIVERY_FIELD_NUMBER: _builtins.int
+        @_builtins.property
+        def delivery(self) -> Global___WebhookDelivery: ...
+        def __init__(
+            self,
+            *,
+            delivery: Global___WebhookDelivery | None = ...,
+        ) -> None: ...
+        _HasFieldArgType: _TypeAlias = _typing.Literal["delivery", b"delivery"]  # noqa: Y015
+        def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+        _ClearFieldArgType: _TypeAlias = _typing.Literal["delivery", b"delivery"]  # noqa: Y015
+        def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+        def WhichOneof(self, oneof_group: _Never) -> None: ...
+
+    DELIVERY_ID_FIELD_NUMBER: _builtins.int
+    delivery_id: _builtins.str
+    def __init__(
+        self,
+        *,
+        delivery_id: _builtins.str | None = ...,
+    ) -> None: ...
+    _HasFieldArgType: _TypeAlias = _typing.Literal["delivery_id", b"delivery_id"]  # noqa: Y015
+    def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["delivery_id", b"delivery_id"]  # noqa: Y015
+    def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    def WhichOneof(self, oneof_group: _Never) -> None: ...
+
+Global___RedeliverWebhookDelivery: _TypeAlias = RedeliverWebhookDelivery  # noqa: Y015
+
 # Appended by dev/generate_protos.py:
 from google.protobuf import service as _service
 

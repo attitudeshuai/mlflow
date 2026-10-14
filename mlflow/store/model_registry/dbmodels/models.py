@@ -30,6 +30,13 @@ from mlflow.entities.webhook import (
     WebhookEvent,
     WebhookStatus,
 )
+from mlflow.entities.webhook_delivery import (
+    WebhookDelivery,
+    WebhookDeliveryAttempt,
+    WebhookDeliveryAttemptResult,
+    WebhookDeliveryStatus,
+    WebhookDeliveryTrigger,
+)
 from mlflow.environment_variables import MLFLOW_WEBHOOK_SECRET_ENCRYPTION_KEY
 from mlflow.store.db.base_sql_model import Base
 from mlflow.utils.time import get_current_time_millis
@@ -382,3 +389,122 @@ class SqlWebhookEvent(Base):
 
     def to_mlflow_entity(self):
         return WebhookEvent(entity=WebhookEntity(self.entity), action=WebhookAction(self.action))
+
+
+class SqlWebhookDelivery(Base):
+    __tablename__ = "webhook_deliveries"
+
+    workspace = Column(
+        String(63),
+        nullable=False,
+        default=DEFAULT_WORKSPACE_NAME,
+        server_default=sa.text(f"'{DEFAULT_WORKSPACE_NAME}'"),
+    )
+    delivery_id = Column(String(36), nullable=False)
+    # No hard foreign key to webhooks: records remain auditable after the
+    # subscription is (soft-)deleted. Name/URL are snapshotted below.
+    webhook_id = Column(String(256), nullable=False)
+    webhook_name = Column(String(256), nullable=True)
+    webhook_url = Column(String(500), nullable=True)
+    entity = Column(String(50), nullable=False)
+    action = Column(String(50), nullable=False)
+    # Identifier-only JSON summary of the payload; full content is not retained.
+    payload_summary = Column(Text(), nullable=True)
+    status = Column(String(20), nullable=False, default="PENDING")
+    trigger = Column(String(20), nullable=False, default="INITIAL")
+    root_delivery_id = Column(String(36), nullable=False)
+    parent_delivery_id = Column(String(36), nullable=True)
+    redelivery_count = Column(Integer, nullable=False, default=0)
+    failure_reason = Column(Text(), nullable=True)
+    creation_timestamp = Column(BigInteger, default=get_current_time_millis)
+    completed_timestamp = Column(BigInteger, nullable=True, default=None)
+    # Set when an automatic redelivery is scheduled; NULL after the delivery
+    # is claimed by the scheduler or when no retry is scheduled.
+    next_retry_at = Column(BigInteger, nullable=True, default=None)
+
+    attempts = relationship(
+        "SqlWebhookDeliveryAttempt",
+        backref=backref("delivery"),
+        cascade="all, delete-orphan",
+        order_by="SqlWebhookDeliveryAttempt.attempt_number",
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("delivery_id", name="webhook_delivery_pk"),
+        Index("idx_webhook_deliveries_webhook_id", "webhook_id"),
+        Index("idx_webhook_deliveries_event", "entity", "action"),
+        Index("idx_webhook_deliveries_status", "status"),
+        Index("idx_webhook_deliveries_creation_ts", "creation_timestamp"),
+        Index("idx_webhook_deliveries_root", "root_delivery_id"),
+        Index("idx_webhook_deliveries_workspace", "workspace"),
+        Index("idx_webhook_deliveries_next_retry_at", "next_retry_at"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<SqlWebhookDelivery ({self.delivery_id}, {self.webhook_id}, "
+            f"{self.entity}.{self.action}, {self.status}, {self.trigger})>"
+        )
+
+    def to_mlflow_entity(self):
+        return WebhookDelivery(
+            delivery_id=self.delivery_id,
+            webhook_id=self.webhook_id,
+            event=WebhookEvent(
+                entity=WebhookEntity(self.entity), action=WebhookAction(self.action)
+            ),
+            webhook_name=self.webhook_name,
+            webhook_url=self.webhook_url,
+            payload_summary=self.payload_summary,
+            status=WebhookDeliveryStatus(self.status),
+            trigger=WebhookDeliveryTrigger(self.trigger),
+            root_delivery_id=self.root_delivery_id,
+            parent_delivery_id=self.parent_delivery_id,
+            redelivery_count=self.redelivery_count,
+            failure_reason=self.failure_reason,
+            creation_timestamp=self.creation_timestamp,
+            completed_timestamp=self.completed_timestamp,
+            attempts=[attempt.to_mlflow_entity() for attempt in self.attempts],
+            workspace=self.workspace,
+        )
+
+
+class SqlWebhookDeliveryAttempt(Base):
+    __tablename__ = "webhook_delivery_attempts"
+
+    delivery_id = Column(
+        String(36),
+        ForeignKey("webhook_deliveries.delivery_id", ondelete="cascade"),
+        nullable=False,
+    )
+    attempt_number = Column(Integer, nullable=False)
+    started_timestamp = Column(BigInteger, nullable=False)
+    completed_timestamp = Column(BigInteger, nullable=False)
+    # WebhookDeliveryAttemptResult value: ATTEMPT_SUCCESS / HTTP_ERROR / REQUEST_ERROR
+    result = Column(String(20), nullable=False)
+    http_status = Column(Integer, nullable=True)
+    error_type = Column(String(200), nullable=True)
+    error_message = Column(Text(), nullable=True)
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "delivery_id", "attempt_number", name="webhook_delivery_attempt_pk"
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<SqlWebhookDeliveryAttempt ({self.delivery_id}, "
+            f"{self.attempt_number}, {self.result})>"
+        )
+
+    def to_mlflow_entity(self):
+        return WebhookDeliveryAttempt(
+            attempt_number=self.attempt_number,
+            started_timestamp=self.started_timestamp,
+            completed_timestamp=self.completed_timestamp,
+            result=WebhookDeliveryAttemptResult(self.result),
+            http_status=self.http_status,
+            error_type=self.error_type,
+            error_message=self.error_message,
+        )

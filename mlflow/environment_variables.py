@@ -1596,6 +1596,111 @@ MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES = _EnvironmentVariable(
 #: (default: ``60``)
 MLFLOW_WEBHOOK_CACHE_TTL = _EnvironmentVariable("MLFLOW_WEBHOOK_CACHE_TTL", int, 60)
 
+
+def _positive_int(env_name: str):
+    """Build a converter that only accepts strictly positive integers.
+
+    Used by webhook delivery/redelivery settings so that invalid values fail
+    at configuration parsing time with an actionable error message.
+    """
+
+    def convert(val: str) -> int:
+        try:
+            int_val = int(val)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"{env_name} must be a positive integer (>= 1), but got {val!r}"
+            ) from e
+        if int_val <= 0:
+            raise ValueError(
+                f"{env_name} must be a positive integer (>= 1), but got {int_val}"
+            )
+        return int_val
+
+    return convert
+
+
+def _webhook_redelivery_backoff(val: str) -> str:
+    backoff = val.strip().lower()
+    if backoff not in ("fixed", "exponential"):
+        raise ValueError(
+            "MLFLOW_WEBHOOK_REDELIVERY_BACKOFF must be one of ['fixed', 'exponential'], "
+            f"but got {val!r}"
+        )
+    return backoff
+
+
+#: Whether to persist webhook delivery records (delivery id, event, target
+#: subscription, per-attempt timestamps/results, final status and failure
+#: reason). When disabled (the default), the delivery path is identical to the
+#: fire-and-forget behavior and no record is ever written.
+#: (default: ``False``)
+MLFLOW_WEBHOOK_DELIVERY_RECORD_ENABLED = _BooleanEnvironmentVariable(
+    "MLFLOW_WEBHOOK_DELIVERY_RECORD_ENABLED", False
+)
+
+#: Maximum number of webhook delivery records (including their attempt rows) to
+#: retain. When the number is exceeded, oldest records by creation time are
+#: evicted. Must be a positive integer.
+#: (default: ``100000``)
+MLFLOW_WEBHOOK_DELIVERY_RECORD_RETENTION = _EnvironmentVariable(
+    "MLFLOW_WEBHOOK_DELIVERY_RECORD_RETENTION",
+    _positive_int("MLFLOW_WEBHOOK_DELIVERY_RECORD_RETENTION"),
+    100000,
+)
+
+#: Whether to automatically reschedule failed webhook deliveries according to
+#: the backoff/attempt policy below. Requires delivery recording to be enabled.
+#: (default: ``False``)
+MLFLOW_WEBHOOK_AUTOMATIC_REDELIVERY_ENABLED = _BooleanEnvironmentVariable(
+    "MLFLOW_WEBHOOK_AUTOMATIC_REDELIVERY_ENABLED", False
+)
+
+#: Maximum number of redeliveries (manual generations are counted too) that
+#: the automatic scheduler is allowed to create along a delivery chain. Must be
+#: a positive integer.
+#: (default: ``5``)
+MLFLOW_WEBHOOK_REDELIVERY_MAX_ATTEMPTS = _EnvironmentVariable(
+    "MLFLOW_WEBHOOK_REDELIVERY_MAX_ATTEMPTS",
+    _positive_int("MLFLOW_WEBHOOK_REDELIVERY_MAX_ATTEMPTS"),
+    5,
+)
+
+#: Base interval in seconds between automatic redelivery attempts. Must be a
+#: positive integer.
+#: (default: ``300``)
+MLFLOW_WEBHOOK_REDELIVERY_INTERVAL_SECONDS = _EnvironmentVariable(
+    "MLFLOW_WEBHOOK_REDELIVERY_INTERVAL_SECONDS",
+    _positive_int("MLFLOW_WEBHOOK_REDELIVERY_INTERVAL_SECONDS"),
+    300,
+)
+
+#: Backoff strategy for automatic redelivery: ``fixed`` repeats the base
+#: interval, ``exponential`` multiplies it by ``2 ** redelivery_count``.
+#: (default: ``exponential``)
+MLFLOW_WEBHOOK_REDELIVERY_BACKOFF = _EnvironmentVariable(
+    "MLFLOW_WEBHOOK_REDELIVERY_BACKOFF", _webhook_redelivery_backoff, "exponential"
+)
+
+#: Interval in seconds between automatic redelivery scheduler ticks. Must be a
+#: positive integer.
+#: (default: ``60``)
+MLFLOW_WEBHOOK_REDELIVERY_POLL_INTERVAL_SECONDS = _EnvironmentVariable(
+    "MLFLOW_WEBHOOK_REDELIVERY_POLL_INTERVAL_SECONDS",
+    _positive_int("MLFLOW_WEBHOOK_REDELIVERY_POLL_INTERVAL_SECONDS"),
+    60,
+)
+
+#: Maximum number of due deliveries claimed by the automatic scheduler in a
+#: single tick. Must be a positive integer.
+#: (default: ``100``)
+MLFLOW_WEBHOOK_REDELIVERY_BATCH_SIZE = _EnvironmentVariable(
+    "MLFLOW_WEBHOOK_REDELIVERY_BATCH_SIZE",
+    _positive_int("MLFLOW_WEBHOOK_REDELIVERY_BATCH_SIZE"),
+    100,
+)
+
+
 #: Whether to allow webhook URLs that resolve to private/internal IP addresses.
 #: When set to ``true``, SSRF protection is disabled and webhooks can target
 #: localhost, private IPs, and cloud metadata endpoints.

@@ -17,6 +17,12 @@ from mlflow.entities.model_registry.model_version_stages import (
 )
 from mlflow.entities.model_registry.prompt_version import IS_PROMPT_TAG_KEY
 from mlflow.entities.webhook import Webhook, WebhookEvent, WebhookStatus
+from mlflow.entities.webhook_delivery import (
+    WebhookDelivery,
+    WebhookDeliveryAttemptResult,
+    WebhookDeliveryStatus,
+    WebhookDeliveryTrigger,
+)
 from mlflow.exceptions import MlflowException
 from mlflow.prompt.registry_utils import handle_resource_already_exist_error, has_prompt_tag
 from mlflow.protos.databricks_pb2 import (
@@ -48,6 +54,8 @@ from mlflow.store.model_registry.dbmodels.models import (
     SqlRegisteredModelAlias,
     SqlRegisteredModelTag,
     SqlWebhook,
+    SqlWebhookDelivery,
+    SqlWebhookDeliveryAttempt,
     SqlWebhookEvent,
 )
 from mlflow.tracking.client import MlflowClient
@@ -78,6 +86,7 @@ _WORKSPACE_MODELS = (
     SqlRegisteredModel,
     SqlModelVersion,
     SqlWebhook,
+    SqlWebhookDelivery,
     SqlRegisteredModelTag,
     SqlModelVersionTag,
     SqlRegisteredModelAlias,
@@ -1795,3 +1804,301 @@ class SqlAlchemyStore(AbstractStore):
             return webhook
 
         raise MlflowException(f"Webhook with ID {webhook_id} not found.", RESOURCE_DOES_NOT_EXIST)
+
+    # Webhook delivery record operations
+
+    # Maximum persisted length of free-form failure/error text. Longer messages
+    # are truncated so that no delivery error can blow up the column limit.
+    _WEBHOOK_DELIVERY_MAX_TEXT_LENGTH = 4096
+
+    @staticmethod
+    def _truncate_delivery_text(value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value[:SqlAlchemyStore._WEBHOOK_DELIVERY_MAX_TEXT_LENGTH]
+
+    def _get_delivery_row_for_write(self, session: Session, delivery_id: str, workspace: str | None):
+        """Fetch a delivery row by id with an explicit workspace guard.
+
+        Delivery writes happen on worker threads where the request-scoped
+        WorkspaceContext is not propagated, so this deliberately bypasses
+        ``_get_query`` and filters by the record's own workspace.
+        """
+        query = session.query(SqlWebhookDelivery).filter(
+            SqlWebhookDelivery.delivery_id == delivery_id
+        )
+        if workspace is not None:
+            query = query.filter(SqlWebhookDelivery.workspace == workspace)
+        row = query.first()
+        if row is None:
+            raise MlflowException(
+                f"Webhook delivery with ID {delivery_id} not found.",
+                RESOURCE_DOES_NOT_EXIST,
+            )
+        return row
+
+    def create_webhook_delivery(
+        self,
+        *,
+        delivery_id: str,
+        webhook_id: str,
+        event: WebhookEvent,
+        trigger: WebhookDeliveryTrigger,
+        webhook_name: str | None = None,
+        webhook_url: str | None = None,
+        payload_summary: str | None = None,
+        root_delivery_id: str | None = None,
+        parent_delivery_id: str | None = None,
+        redelivery_count: int = 0,
+        workspace: str | None = None,
+    ) -> WebhookDelivery:
+        creation_time = get_current_time_millis()
+        with self.ManagedSessionMaker(read_only=False) as session:
+            delivery = self._with_workspace_field(
+                SqlWebhookDelivery(
+                    delivery_id=delivery_id,
+                    webhook_id=webhook_id,
+                    webhook_name=webhook_name,
+                    webhook_url=webhook_url,
+                    entity=event.entity.value,
+                    action=event.action.value,
+                    payload_summary=payload_summary,
+                    status=WebhookDeliveryStatus.PENDING.value,
+                    trigger=(
+                        trigger.value if isinstance(trigger, WebhookDeliveryTrigger) else trigger
+                    ),
+                    root_delivery_id=root_delivery_id or delivery_id,
+                    parent_delivery_id=parent_delivery_id,
+                    redelivery_count=redelivery_count,
+                    creation_timestamp=creation_time,
+                )
+            )
+            if workspace is not None:
+                delivery.workspace = workspace
+            session.add(delivery)
+            session.flush()
+            return delivery.to_mlflow_entity()
+
+    def add_webhook_delivery_attempt(
+        self,
+        *,
+        delivery_id: str,
+        attempt_number: int,
+        started_timestamp: int,
+        completed_timestamp: int,
+        result: WebhookDeliveryAttemptResult,
+        http_status: int | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+        workspace: str | None = None,
+    ) -> None:
+        with self.ManagedSessionMaker(read_only=False) as session:
+            self._get_delivery_row_for_write(session, delivery_id, workspace)
+            session.add(
+                SqlWebhookDeliveryAttempt(
+                    delivery_id=delivery_id,
+                    attempt_number=attempt_number,
+                    started_timestamp=started_timestamp,
+                    completed_timestamp=completed_timestamp,
+                    result=result.value,
+                    http_status=http_status,
+                    error_type=(error_type or None) and error_type[:200],
+                    error_message=self._truncate_delivery_text(error_message),
+                )
+            )
+            session.flush()
+
+    def complete_webhook_delivery(
+        self,
+        *,
+        delivery_id: str,
+        status: WebhookDeliveryStatus,
+        completed_timestamp: int,
+        failure_reason: str | None = None,
+        workspace: str | None = None,
+    ) -> None:
+        with self.ManagedSessionMaker(read_only=False) as session:
+            delivery = self._get_delivery_row_for_write(session, delivery_id, workspace)
+            delivery.status = status.value
+            delivery.completed_timestamp = completed_timestamp
+            delivery.failure_reason = self._truncate_delivery_text(failure_reason)
+            session.add(delivery)
+            session.flush()
+
+    def get_webhook_delivery(self, delivery_id: str) -> WebhookDelivery:
+        with self.ManagedSessionMaker() as session:
+            delivery = (
+                self._get_query(session, SqlWebhookDelivery)
+                .filter(SqlWebhookDelivery.delivery_id == delivery_id)
+                .first()
+            )
+            if delivery is None:
+                raise MlflowException(
+                    f"Webhook delivery with ID {delivery_id} not found.",
+                    RESOURCE_DOES_NOT_EXIST,
+                )
+            return delivery.to_mlflow_entity()
+
+    def list_webhook_deliveries(
+        self,
+        *,
+        webhook_id: str | None = None,
+        event: WebhookEvent | None = None,
+        status: WebhookDeliveryStatus | None = None,
+        start_timestamp: int | None = None,
+        end_timestamp: int | None = None,
+        max_results: int | None = None,
+        page_token: str | None = None,
+    ) -> PagedList[WebhookDelivery]:
+        max_results = max_results or 100
+        if max_results < 1 or max_results > 1000:
+            raise MlflowException(
+                "max_results must be between 1 and 1000.", INVALID_PARAMETER_VALUE
+            )
+        if start_timestamp is not None and end_timestamp is not None:
+            if start_timestamp > end_timestamp:
+                raise MlflowException(
+                    "start_timestamp must be <= end_timestamp.", INVALID_PARAMETER_VALUE
+                )
+
+        offset = SearchUtils.parse_start_offset_from_page_token(page_token)
+        with self.ManagedSessionMaker() as session:
+            query = self._get_query(session, SqlWebhookDelivery)
+            if webhook_id is not None:
+                query = query.filter(SqlWebhookDelivery.webhook_id == webhook_id)
+            if event is not None:
+                query = query.filter(
+                    SqlWebhookDelivery.entity == event.entity.value,
+                    SqlWebhookDelivery.action == event.action.value,
+                )
+            if status is not None:
+                query = query.filter(
+                    SqlWebhookDelivery.status == status.value
+                    if isinstance(status, WebhookDeliveryStatus)
+                    else status
+                )
+            if start_timestamp is not None:
+                query = query.filter(
+                    SqlWebhookDelivery.creation_timestamp >= start_timestamp
+                )
+            if end_timestamp is not None:
+                query = query.filter(SqlWebhookDelivery.creation_timestamp <= end_timestamp)
+
+            rows = (
+                query.order_by(
+                    SqlWebhookDelivery.creation_timestamp.desc(),
+                    SqlWebhookDelivery.delivery_id.desc(),
+                )
+                .limit(max_results + 1)
+                .offset(offset if page_token else 0)
+                .all()
+            )
+
+            has_next_page = len(rows) > max_results
+            next_page_token = None
+            if has_next_page:
+                rows = rows[:max_results]
+                next_page_token = SearchUtils.create_page_token(offset + max_results)
+
+            return PagedList([row.to_mlflow_entity() for row in rows], next_page_token)
+
+    def claim_due_webhook_deliveries(
+        self, *, now: int, limit: int
+    ) -> list[WebhookDelivery]:
+        if limit < 1:
+            raise MlflowException("limit must be >= 1.", INVALID_PARAMETER_VALUE)
+
+        with self.ManagedSessionMaker(read_only=False) as session:
+            candidates = (
+                session.query(
+                    SqlWebhookDelivery.delivery_id, SqlWebhookDelivery.next_retry_at
+                )
+                .filter(
+                    SqlWebhookDelivery.status == WebhookDeliveryStatus.FAILURE.value,
+                    SqlWebhookDelivery.next_retry_at.isnot(None),
+                    SqlWebhookDelivery.next_retry_at <= now,
+                )
+                .order_by(SqlWebhookDelivery.next_retry_at.asc())
+                .limit(limit)
+                .all()
+            )
+
+            claimed_ids = []
+            for delivery_id, scheduled_at in candidates:
+                # Conditional update: only the first transaction can clear the
+                # due timestamp; concurrent schedulers match zero rows.
+                updated = (
+                    session.query(SqlWebhookDelivery)
+                    .filter(
+                        SqlWebhookDelivery.delivery_id == delivery_id,
+                        SqlWebhookDelivery.next_retry_at == scheduled_at,
+                    )
+                    .update(
+                        {SqlWebhookDelivery.next_retry_at: None},
+                        synchronize_session=False,
+                    )
+                )
+                if updated == 1:
+                    claimed_ids.append(delivery_id)
+
+            if not claimed_ids:
+                return []
+
+            claimed_rows = (
+                session.query(SqlWebhookDelivery)
+                .filter(SqlWebhookDelivery.delivery_id.in_(claimed_ids))
+                .all()
+            )
+            return [row.to_mlflow_entity() for row in claimed_rows]
+
+    def schedule_webhook_delivery_retry(
+        self,
+        *,
+        delivery_id: str,
+        next_retry_at: int | None,
+        workspace: str | None = None,
+    ) -> None:
+        with self.ManagedSessionMaker(read_only=False) as session:
+            delivery = self._get_delivery_row_for_write(session, delivery_id, workspace)
+            delivery.next_retry_at = next_retry_at
+            session.add(delivery)
+            session.flush()
+
+    def prune_webhook_deliveries(
+        self, retention: int, *, workspace: str | None = None
+    ) -> None:
+        if retention < 1:
+            raise MlflowException("retention must be >= 1.", INVALID_PARAMETER_VALUE)
+
+        with self.ManagedSessionMaker(read_only=False) as session:
+            query = session.query(SqlWebhookDelivery)
+            if workspace is not None:
+                query = query.filter(SqlWebhookDelivery.workspace == workspace)
+
+            total = query.count()
+            if total <= retention:
+                return
+
+            excess_ids = [
+                row.delivery_id
+                for row in query.with_entities(SqlWebhookDelivery.delivery_id)
+                .order_by(
+                    SqlWebhookDelivery.creation_timestamp.asc(),
+                    SqlWebhookDelivery.delivery_id.asc(),
+                )
+                .limit(total - retention)
+                .all()
+            ]
+
+            # Delete child rows first for dialects that do not enforce FK cascades.
+            (
+                session.query(SqlWebhookDeliveryAttempt)
+                .filter(SqlWebhookDeliveryAttempt.delivery_id.in_(excess_ids))
+                .delete(synchronize_session=False)
+            )
+            (
+                session.query(SqlWebhookDelivery)
+                .filter(SqlWebhookDelivery.delivery_id.in_(excess_ids))
+                .delete(synchronize_session=False)
+            )
+            session.flush()

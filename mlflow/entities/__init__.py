@@ -104,6 +104,13 @@ from mlflow.entities.webhook import (
     WebhookStatus,
     WebhookTestResult,
 )
+from mlflow.entities.webhook_delivery import (
+    WebhookDelivery,
+    WebhookDeliveryAttempt,
+    WebhookDeliveryAttemptResult,
+    WebhookDeliveryStatus,
+    WebhookDeliveryTrigger,
+)
 from mlflow.entities.workspace import TraceArchivalConfig, Workspace, WorkspaceDeletionMode
 
 __all__ = [
@@ -194,6 +201,11 @@ __all__ = [
     "WebhookEvent",
     "WebhookStatus",
     "WebhookTestResult",
+    "WebhookDelivery",
+    "WebhookDeliveryAttempt",
+    "WebhookDeliveryAttemptResult",
+    "WebhookDeliveryStatus",
+    "WebhookDeliveryTrigger",
     "TraceArchivalConfig",
     "Workspace",
     "WorkspaceDeletionMode",

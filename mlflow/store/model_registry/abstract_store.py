@@ -18,6 +18,12 @@ from mlflow.entities.model_registry.prompt_version import (
     PromptVersion,
 )
 from mlflow.entities.webhook import Webhook, WebhookEvent, WebhookStatus, WebhookTestResult
+from mlflow.entities.webhook_delivery import (
+    WebhookDelivery,
+    WebhookDeliveryAttemptResult,
+    WebhookDeliveryStatus,
+    WebhookDeliveryTrigger,
+)
 from mlflow.exceptions import MlflowException
 from mlflow.prompt.constants import (
     _STORE_PROMPT_SOURCE_PLACEHOLDER,
@@ -1306,6 +1312,111 @@ class AbstractStore:
             WebhookTestResult indicating success/failure and response details
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support test_webhook")
+
+    # Webhook delivery record APIs
+    def create_webhook_delivery(
+        self,
+        *,
+        delivery_id: str,
+        webhook_id: str,
+        event: WebhookEvent,
+        trigger: WebhookDeliveryTrigger,
+        webhook_name: str | None = None,
+        webhook_url: str | None = None,
+        payload_summary: str | None = None,
+        root_delivery_id: str | None = None,
+        parent_delivery_id: str | None = None,
+        redelivery_count: int = 0,
+        workspace: str | None = None,
+    ) -> WebhookDelivery:
+        """Persist a new PENDING webhook delivery record."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support create_webhook_delivery"
+        )
+
+    def add_webhook_delivery_attempt(
+        self,
+        *,
+        delivery_id: str,
+        attempt_number: int,
+        started_timestamp: int,
+        completed_timestamp: int,
+        result: WebhookDeliveryAttemptResult,
+        http_status: int | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+        workspace: str | None = None,
+    ) -> None:
+        """Append one HTTP attempt record to a webhook delivery."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support add_webhook_delivery_attempt"
+        )
+
+    def complete_webhook_delivery(
+        self,
+        *,
+        delivery_id: str,
+        status: WebhookDeliveryStatus,
+        completed_timestamp: int,
+        failure_reason: str | None = None,
+        workspace: str | None = None,
+    ) -> None:
+        """Set the final status of a webhook delivery."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support complete_webhook_delivery"
+        )
+
+    def get_webhook_delivery(self, delivery_id: str) -> WebhookDelivery:
+        """Get a webhook delivery record (including all attempts) by id."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support get_webhook_delivery"
+        )
+
+    def list_webhook_deliveries(
+        self,
+        *,
+        webhook_id: str | None = None,
+        event: WebhookEvent | None = None,
+        status: WebhookDeliveryStatus | None = None,
+        start_timestamp: int | None = None,
+        end_timestamp: int | None = None,
+        max_results: int | None = None,
+        page_token: str | None = None,
+    ) -> PagedList[WebhookDelivery]:
+        """List webhook delivery records with optional filters, newest first."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support list_webhook_deliveries"
+        )
+
+    def claim_due_webhook_deliveries(
+        self, *, now: int, limit: int
+    ) -> list[WebhookDelivery]:
+        """Atomically claim due failed deliveries for automatic redelivery.
+
+        Claims across all workspaces; claimed rows have ``next_retry_at`` cleared
+        so that concurrent schedulers cannot claim the same record twice.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support claim_due_webhook_deliveries"
+        )
+
+    def schedule_webhook_delivery_retry(
+        self,
+        *,
+        delivery_id: str,
+        next_retry_at: int | None,
+        workspace: str | None = None,
+    ) -> None:
+        """Set or clear the next automatic redelivery time for a delivery."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support schedule_webhook_delivery_retry"
+        )
+
+    def prune_webhook_deliveries(self, retention: int, *, workspace: str | None = None) -> None:
+        """Evict oldest delivery records (and their attempts) beyond ``retention``."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support prune_webhook_deliveries"
+        )
 
     @property
     def supports_workspaces(self) -> bool:
