@@ -4,6 +4,7 @@ import os
 import posixpath
 import re
 import tempfile
+import threading
 import traceback
 import uuid
 from abc import ABC, ABCMeta, abstractmethod
@@ -18,6 +19,12 @@ from mlflow.entities.multipart_upload import (
     MultipartUploadPart,
 )
 from mlflow.entities.trace_data import TraceData
+from mlflow.environment_variables import (
+    MLFLOW_ARTIFACT_CHECKSUM_ALGORITHM,
+    MLFLOW_ARTIFACT_CHECKSUM_ENABLED,
+    MLFLOW_ARTIFACT_CHECKSUM_MAX_ATTEMPTS,
+    MLFLOW_ARTIFACT_CHECKSUM_UNSUPPORTED_POLICY,
+)
 from mlflow.exceptions import (
     MlflowException,
     MlflowTraceDataCorrupted,
@@ -29,12 +36,38 @@ from mlflow.protos.databricks_pb2 import (
     RESOURCE_DOES_NOT_EXIST,
     ErrorCode,
 )
+from mlflow.store.artifact.checksum import (
+    ARTIFACT_CHECKSUM_MANIFEST_FILE_NAME,
+    DIGEST_MISMATCH,
+    MANIFEST_STATE_MALFORMED,
+    MANIFEST_STATE_MISSING,
+    MANIFEST_STATE_PRESENT,
+    MANIFEST_STATE_UNAVAILABLE,
+    SIZE_MISMATCH,
+    VERIFICATION_STATUS_FAILED,
+    VERIFICATION_STATUS_SKIPPED,
+    VERIFICATION_STATUS_VERIFIED,
+    ArtifactChecksumMismatchException,
+    ArtifactChecksumReport,
+    ArtifactManifestMalformed,
+    FileChecksumFailure,
+    build_manifest,
+    compute_file_digest,
+    is_manifest_file,
+    is_missing_artifact_error,
+    parse_manifest,
+    serialize_manifest,
+)
 from mlflow.tracing.utils.artifact_utils import TRACE_DATA_FILE_NAME
 from mlflow.utils.annotations import developer_stable
 from mlflow.utils.async_logging.async_artifacts_logging_queue import (
     AsyncArtifactsLoggingQueue,
 )
-from mlflow.utils.file_utils import ArtifactProgressBar, create_tmp_dir
+from mlflow.utils.file_utils import (
+    ArtifactProgressBar,
+    create_tmp_dir,
+    relative_path_to_artifact_path,
+)
 from mlflow.utils.os import is_windows
 from mlflow.utils.uri import validate_path_within_directory
 from mlflow.utils.validation import bad_path_message, path_not_unique
@@ -168,6 +201,15 @@ class ArtifactRepository:
         # constants._NUM_MAX_THREADS threads or 2 * the number of CPU cores available on the
         # system (whichever is smaller)
         self.thread_pool = self._create_thread_pool()
+        # Serializes read-modify-write of the checksum manifest so that concurrent uploads
+        # (e.g. multi-file uploads on a thread pool) cannot overwrite each other's entries.
+        self._artifact_manifest_lock = threading.RLock()
+        # Per-thread collection of files uploaded inside a serial log_artifacts() batch,
+        # so the manifest is written once instead of once per file.
+        self._artifact_checksum_state = threading.local()
+        # Set by log_artifacts() implementations that fan out through a different thread
+        # pool; suppresses per-file manifest writes in their worker threads.
+        self._artifact_checksum_suppressed = False
 
         def log_artifact_handler(filename, artifact_path=None, artifact=None):
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -381,17 +423,19 @@ class ArtifactRepository:
         else:
             dst_path = create_tmp_dir()
 
-        def _download_file(src_artifact_path, dst_local_dir_path):
+        def _plan_download(src_artifact_path, dst_local_dir_path):
             dst_local_file_path = self._create_download_destination(
                 src_artifact_path=src_artifact_path, dst_local_dir_path=dst_local_dir_path
             )
-            return self.thread_pool.submit(
+            future = self.thread_pool.submit(
                 self._download_file,
                 remote_file_path=src_artifact_path,
                 local_path=dst_local_file_path,
             )
+            return future, dst_local_file_path
 
-        # Submit download tasks
+        # Submit download tasks. Each future maps to (remote path, local destination)
+        # so that post-transfer checksum verification can hash the landed files.
         futures = {}
         if artifact_path in ("", None):
             root_listing = self.list_artifacts(artifact_path)
@@ -415,11 +459,11 @@ class ArtifactRepository:
                     validate_path_within_directory(dst_path, normalized_path)
                     os.makedirs(normalized_path, exist_ok=True)
                 else:
-                    fut = _download_file(file_info.path, dst_path)
-                    futures[fut] = file_info.path
+                    fut, local_destination = _plan_download(file_info.path, dst_path)
+                    futures[fut] = (file_info.path, local_destination)
         else:
-            fut = _download_file(artifact_path, dst_path)
-            futures[fut] = artifact_path
+            fut, local_destination = _plan_download(artifact_path, dst_path)
+            futures[fut] = (artifact_path, local_destination)
 
         # Wait for downloads to complete and collect failures
         failed_downloads = {}
@@ -430,7 +474,7 @@ class ArtifactRepository:
                     f.result()
                     pbar.update()
                 except Exception as e:
-                    path = futures[f]
+                    path = futures[f][0]
                     failed_downloads[path] = e
                     tracebacks[path] = traceback.format_exc()
 
@@ -460,6 +504,12 @@ class ArtifactRepository:
                 error_code=error_code,
             )
 
+        # All transfers completed; compare the landed bytes against the checksum
+        # manifest before reporting success. No-op when verification is disabled.
+        self._verify_or_skip(
+            {remote_path: local_path for remote_path, local_path in futures.values()}
+        )
+
         if artifact_path:
             sanitized_path = _sanitize_path_for_windows(artifact_path)
             return os.path.join(dst_path, os.path.normpath(sanitized_path))
@@ -476,6 +526,391 @@ class ArtifactRepository:
                 directory of the artifact repository.
             local_path: The path to which to save the downloaded file.
         """
+
+    # ------------------------------------------------------------------
+    # Optional content digest (checksum) verification
+    # ------------------------------------------------------------------
+    #
+    # When MLFLOW_ARTIFACT_CHECKSUM_ENABLED is set, uploads maintain a manifest
+    # artifact (``mlflow-artifact-manifest.json`` at the repository root) mapping
+    # repository-relative file paths to size and content digest. Downloads verify
+    # each file against the manifest. All hooks are no-ops when verification is
+    # disabled, so transfers behave exactly as before.
+
+    def _artifact_checksum_enabled(self) -> bool:
+        return MLFLOW_ARTIFACT_CHECKSUM_ENABLED.get()
+
+    @staticmethod
+    def _artifact_remote_path(local_file, artifact_path=None) -> str:
+        name = os.path.basename(local_file)
+        return posixpath.join(artifact_path, name) if artifact_path else name
+
+    @contextmanager
+    def _collect_artifact_checksums(self):
+        """Collect source files of a serial batch upload for a single manifest write.
+
+        ``_record_uploaded_artifact`` calls inside the context append their files to
+        the yielded mapping instead of each performing a manifest read-modify-write.
+        The manifest is written once when the context exits without an exception.
+        """
+        if not self._artifact_checksum_enabled():
+            yield {}
+            return
+        previous = getattr(self._artifact_checksum_state, "batch_sources", None)
+        sources = previous if previous is not None else {}
+        self._artifact_checksum_state.batch_sources = sources
+        try:
+            yield sources
+            if previous is None and sources:
+                self._record_artifact_sources(dict(sources))
+        finally:
+            self._artifact_checksum_state.batch_sources = previous
+
+    @contextmanager
+    def _suppress_artifact_checksums(self):
+        """Suppress per-file manifest writes for batch uploads using separate pools."""
+        previous = self._artifact_checksum_suppressed
+        self._artifact_checksum_suppressed = True
+        try:
+            yield
+        finally:
+            self._artifact_checksum_suppressed = previous
+
+    def _record_uploaded_artifact(self, local_file, artifact_path=None) -> None:
+        """Record a single successfully uploaded file in the checksum manifest."""
+        if not self._artifact_checksum_enabled():
+            return
+        if getattr(self._artifact_checksum_state, "writing_manifest", False):
+            return
+        if self._artifact_checksum_suppressed:
+            return
+        remote_path = self._artifact_remote_path(local_file, artifact_path)
+        if is_manifest_file(remote_path):
+            _logger.warning(
+                "Not recording artifact %r in the checksum manifest: the file name is "
+                "reserved for the manifest itself.",
+                remote_path,
+            )
+            return
+        batch = getattr(self._artifact_checksum_state, "batch_sources", None)
+        if batch is not None:
+            batch[remote_path] = os.path.abspath(local_file)
+            return
+        self._record_artifact_sources({remote_path: os.path.abspath(local_file)})
+
+    def _record_local_dir_artifacts(self, local_dir, artifact_path=None) -> None:
+        """Record all files of an uploaded local directory in the checksum manifest."""
+        if not self._artifact_checksum_enabled():
+            return
+        sources = {}
+        for dirpath, _, filenames in os.walk(local_dir):
+            for name in filenames:
+                src = os.path.join(dirpath, name)
+                rel = relative_path_to_artifact_path(os.path.relpath(src, local_dir))
+                remote_path = posixpath.join(artifact_path, rel) if artifact_path else rel
+                if is_manifest_file(remote_path):
+                    # Never let a user-supplied file with the reserved manifest name
+                    # masquerade as the checksum manifest.
+                    _logger.warning(
+                        "Not recording artifact %r in the checksum manifest: the file name "
+                        "is reserved for the manifest itself.",
+                        remote_path,
+                    )
+                    continue
+                sources[remote_path] = os.path.abspath(src)
+        self._record_artifact_sources(sources)
+
+    def _fetch_checksum_manifest(self) -> tuple[dict | None, str, str | None]:
+        """Download and parse the checksum manifest.
+
+        Returns:
+            A ``(manifest, state, detail)`` tuple where state is one of
+            ``present``/``missing``/``malformed``/``unavailable``.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_path = os.path.join(tmp_dir, ARTIFACT_CHECKSUM_MANIFEST_FILE_NAME)
+            try:
+                self._download_file(ARTIFACT_CHECKSUM_MANIFEST_FILE_NAME, local_path)
+            except Exception as e:
+                if is_missing_artifact_error(e):
+                    return None, MANIFEST_STATE_MISSING, None
+                return None, MANIFEST_STATE_UNAVAILABLE, _truncate_error(str(e))
+            try:
+                with open(local_path, "rb") as f:
+                    raw = f.read()
+                return parse_manifest(raw), MANIFEST_STATE_PRESENT, None
+            except ArtifactManifestMalformed as e:
+                return None, MANIFEST_STATE_MALFORMED, e.reason
+
+    def _load_existing_manifest_for_upload(self) -> dict | None:
+        """Fetch an existing manifest for merging, tolerating its absence or corruption."""
+        manifest, state, detail = self._fetch_checksum_manifest()
+        if state == MANIFEST_STATE_PRESENT:
+            return manifest
+        if state == MANIFEST_STATE_MALFORMED:
+            _logger.warning(
+                "The existing artifact checksum manifest at %s is corrupt or invalid (%s); "
+                "it will be replaced.",
+                self.artifact_uri,
+                detail,
+            )
+        elif state == MANIFEST_STATE_UNAVAILABLE:
+            _logger.warning(
+                "Unable to read the existing artifact checksum manifest at %s (%s); "
+                "writing a new manifest.",
+                self.artifact_uri,
+                detail,
+            )
+        return None
+
+    def _upload_checksum_manifest(self, manifest: dict) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_path = os.path.join(tmp_dir, ARTIFACT_CHECKSUM_MANIFEST_FILE_NAME)
+            with open(local_path, "wb") as f:
+                f.write(serialize_manifest(manifest))
+            previous = getattr(self._artifact_checksum_state, "writing_manifest", False)
+            self._artifact_checksum_state.writing_manifest = True
+            try:
+                self.log_artifact(local_path)
+            finally:
+                self._artifact_checksum_state.writing_manifest = previous
+
+    def _record_artifact_sources(self, sources: dict[str, str]) -> None:
+        """Merge ``remote path -> local source file`` entries into the checksum manifest.
+
+        Degrades to a warning (or raises, depending on
+        ``MLFLOW_ARTIFACT_CHECKSUM_UNSUPPORTED_POLICY``) when the manifest cannot be
+        written. Invalid configuration values are always raised before the degrade
+        policy is applied.
+        """
+        if not sources or not self._artifact_checksum_enabled():
+            return
+        # Fail at configuration parsing time for invalid algorithm/policy values.
+        algorithm = MLFLOW_ARTIFACT_CHECKSUM_ALGORITHM.get()
+        policy = MLFLOW_ARTIFACT_CHECKSUM_UNSUPPORTED_POLICY.get()
+        try:
+            with self._artifact_manifest_lock:
+                existing = self._load_existing_manifest_for_upload()
+                if existing is not None and existing["algorithm"] != algorithm:
+                    # A repository has one manifest and therefore one algorithm; keep
+                    # digesting new files with the algorithm already in use.
+                    _logger.warning(
+                        "Configured checksum algorithm %r differs from the existing manifest "
+                        "algorithm %r at %s; continuing with %r.",
+                        algorithm,
+                        existing["algorithm"],
+                        self.artifact_uri,
+                        existing["algorithm"],
+                    )
+                    algorithm = existing["algorithm"]
+                files = dict(existing["files"]) if existing else {}
+                for remote_path, local_file in sources.items():
+                    if is_manifest_file(remote_path):
+                        continue
+                    size, digest = compute_file_digest(local_file, algorithm)
+                    files[remote_path] = {"size": size, "digest": digest}
+                manifest = build_manifest(
+                    algorithm,
+                    {path: (entry["size"], entry["digest"]) for path, entry in files.items()},
+                )
+                self._upload_checksum_manifest(manifest)
+        except Exception as e:
+            if policy == "error":
+                raise
+            _logger.warning(
+                "Failed to update the artifact checksum manifest at %s (%s); proceeding "
+                "without checksum verification for this upload.",
+                self.artifact_uri,
+                _truncate_error(str(e)),
+            )
+
+    def _log_checksum_report(self, report: ArtifactChecksumReport) -> None:
+        if report.status == VERIFICATION_STATUS_VERIFIED:
+            _logger.info("Artifact checksum verification passed (%s).", report.format_summary())
+        else:
+            _logger.info("Artifact checksum verification skipped (%s).", report.format_summary())
+        if report.unverified_files:
+            _logger.info(
+                "The following downloaded file(s) have no checksum manifest entry and were "
+                "not verified: %s",
+                ", ".join(report.unverified_files),
+            )
+
+    def _redownload_files(self, remote_to_local: dict[str, str]) -> None:
+        """Re-download only the specified files (used after checksum mismatches)."""
+        futures = {
+            self.thread_pool.submit(
+                self._download_file, remote_file_path=remote_path, local_path=local_path
+            ): remote_path
+            for remote_path, local_path in remote_to_local.items()
+        }
+        errors = {}
+        for future in as_completed(futures):
+            remote_path = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                errors[remote_path] = e
+        if errors:
+            details = "; ".join(f"{path}: {err}" for path, err in sorted(errors.items()))
+            raise MlflowException(
+                "Failed to re-download file(s) that did not pass checksum verification: "
+                f"{_truncate_error(details)}"
+            )
+
+    def _verify_files_against_manifest(
+        self,
+        manifest: dict,
+        remote_to_local: dict[str, str],
+        max_attempts: int | None = None,
+    ) -> ArtifactChecksumReport:
+        """Verify local files against a parsed manifest, re-downloading failed files.
+
+        Multipart uploads/downloads are verified as whole files: the digest is
+        computed over the fully assembled local file, so a single conclusion covers
+        all chunks.
+
+        Args:
+            max_attempts: Total verification attempts; failed files are re-downloaded
+                between attempts. Defaults to the configured value. In-place
+                verification (no bytes were transferred) passes 1 since re-downloading
+                a file onto itself cannot repair it.
+        """
+        algorithm = manifest["algorithm"]
+        entries = manifest["files"]
+        if max_attempts is None:
+            max_attempts = max(1, MLFLOW_ARTIFACT_CHECKSUM_MAX_ATTEMPTS.get())
+        else:
+            max_attempts = max(1, max_attempts)
+        pending = dict(remote_to_local)
+        failures: dict[str, FileChecksumFailure] = {}
+        checked: list[str] = []
+        unverified: list[str] = []
+
+        for attempt in range(1, max_attempts + 1):
+            current_failures: dict[str, FileChecksumFailure] = {}
+            for remote_path, local_path in sorted(pending.items()):
+                entry = entries.get(remote_path)
+                if entry is None:
+                    if attempt == 1:
+                        unverified.append(remote_path)
+                    continue
+                if attempt == 1:
+                    checked.append(remote_path)
+                try:
+                    actual_size, actual_digest = compute_file_digest(local_path, algorithm)
+                except OSError as e:
+                    current_failures[remote_path] = FileChecksumFailure(
+                        path=remote_path,
+                        expected_size=entry["size"],
+                        actual_size=None,
+                        expected_digest=entry["digest"],
+                        actual_digest=None,
+                        reason=f"unreadable local file: {e}",
+                    )
+                    continue
+                if actual_size != entry["size"]:
+                    current_failures[remote_path] = FileChecksumFailure(
+                        path=remote_path,
+                        expected_size=entry["size"],
+                        actual_size=actual_size,
+                        expected_digest=entry["digest"],
+                        actual_digest=actual_digest,
+                        reason=SIZE_MISMATCH,
+                    )
+                elif actual_digest != entry["digest"]:
+                    current_failures[remote_path] = FileChecksumFailure(
+                        path=remote_path,
+                        expected_size=entry["size"],
+                        actual_size=actual_size,
+                        expected_digest=entry["digest"],
+                        actual_digest=actual_digest,
+                        reason=DIGEST_MISMATCH,
+                    )
+
+            if not current_failures:
+                failures = {}
+                break
+
+            failures = current_failures
+            if attempt < max_attempts:
+                _logger.warning(
+                    "Checksum verification failed for %d file(s) at %s; re-downloading only "
+                    "the failed file(s) (attempt %d/%d): %s",
+                    len(current_failures),
+                    self.artifact_uri,
+                    attempt + 1,
+                    max_attempts,
+                    ", ".join(sorted(current_failures)),
+                )
+                self._redownload_files(
+                    {path: remote_to_local[path] for path in current_failures}
+                )
+                pending = {path: remote_to_local[path] for path in current_failures}
+
+        report = ArtifactChecksumReport(
+            status=VERIFICATION_STATUS_FAILED if failures else VERIFICATION_STATUS_VERIFIED,
+            manifest_state=MANIFEST_STATE_PRESENT,
+            algorithm=algorithm,
+            checked_files=sorted(checked),
+            unverified_files=sorted(unverified),
+            failures=[failures[path] for path in sorted(failures)],
+        )
+        self._log_checksum_report(report)
+        if failures:
+            raise ArtifactChecksumMismatchException(report)
+        return report
+
+    def _verify_or_skip(
+        self,
+        remote_to_local: dict[str, str],
+        max_attempts: int | None = None,
+    ) -> ArtifactChecksumReport | None:
+        """Verify downloaded/local files, implementing missing-manifest skip semantics."""
+        if not self._artifact_checksum_enabled() or not remote_to_local:
+            return None
+        manifest, state, detail = self._fetch_checksum_manifest()
+        if state == MANIFEST_STATE_MALFORMED:
+            # Reported separately from file content mismatches: a broken manifest
+            # cannot be used to judge any individual file.
+            raise ArtifactManifestMalformed(detail)
+        if state == MANIFEST_STATE_MISSING:
+            _logger.info(
+                "No artifact checksum manifest found at %s; downloaded artifact(s) are treated "
+                "as unverified. Artifacts written without a manifest (e.g. legacy artifacts) "
+                "are not an error.",
+                self.artifact_uri,
+            )
+            report = ArtifactChecksumReport(
+                status=VERIFICATION_STATUS_SKIPPED,
+                manifest_state=MANIFEST_STATE_MISSING,
+                unverified_files=sorted(remote_to_local),
+            )
+            self._log_checksum_report(report)
+            return report
+        if state == MANIFEST_STATE_UNAVAILABLE:
+            message = (
+                f"Unable to read the artifact checksum manifest from {self.artifact_uri}: "
+                f"{detail}. Downloaded artifact(s) are treated as unverified."
+            )
+            if MLFLOW_ARTIFACT_CHECKSUM_UNSUPPORTED_POLICY.get() == "error":
+                raise MlflowException(message)
+            _logger.warning(message)
+            report = ArtifactChecksumReport(
+                status=VERIFICATION_STATUS_SKIPPED,
+                manifest_state=MANIFEST_STATE_UNAVAILABLE,
+                detail=detail,
+                unverified_files=sorted(remote_to_local),
+            )
+            self._log_checksum_report(report)
+            return report
+
+        files = {
+            remote_path: local_path
+            for remote_path, local_path in remote_to_local.items()
+            if not is_manifest_file(remote_path)
+        }
+        return self._verify_files_against_manifest(manifest, files, max_attempts=max_attempts)
 
     def delete_artifacts(self, artifact_path=None):
         """

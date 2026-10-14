@@ -91,11 +91,14 @@ class DatabricksSdkArtifactRepository(ArtifactRepository):
                 f,
                 overwrite=True,
             )
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifacts(self, local_dir: str, artifact_path: str | None = None) -> None:
         local_dir = Path(local_dir).resolve()
         futures: list[Future[None]] = []
-        with self._create_thread_pool() as executor:
+        # Worker threads use a separate pool; suppress their per-file manifest writes and
+        # aggregate the manifest once after every file has been uploaded.
+        with self._create_thread_pool() as executor, self._suppress_artifact_checksums():
             for f in local_dir.rglob("*"):
                 if not f.is_file():
                     continue
@@ -113,8 +116,9 @@ class DatabricksSdkArtifactRepository(ArtifactRepository):
                 )
                 futures.append(fut)
 
-        for fut in futures:
-            fut.result()
+            for fut in futures:
+                fut.result()
+        self._record_local_dir_artifacts(str(local_dir), artifact_path)
 
     def list_artifacts(self, path: str | None = None) -> list[FileInfo]:
         dest_path = self.full_path(path)

@@ -83,6 +83,7 @@ class HttpArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         if self._should_multipart_upload(local_file):
             try:
                 self._try_multipart_upload(local_file, artifact_path)
+                self._record_uploaded_artifact(local_file, artifact_path)
                 return
             except _UnsupportedMultipartUploadException:
                 pass
@@ -97,20 +98,22 @@ class HttpArtifactRepository(ArtifactRepository, MultipartUploadMixin):
                 self._host_creds, endpoint, "PUT", data=f, extra_headers=extra_headers
             )
             augmented_raise_for_status(resp)
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         local_dir = os.path.abspath(local_dir)
-        for root, _, filenames in os.walk(local_dir):
-            if root == local_dir:
-                artifact_dir = artifact_path
-            else:
-                rel_path = os.path.relpath(root, local_dir)
-                rel_path = relative_path_to_artifact_path(rel_path)
-                artifact_dir = (
-                    posixpath.join(artifact_path, rel_path) if artifact_path else rel_path
-                )
-            for f in filenames:
-                self.log_artifact(os.path.join(root, f), artifact_dir)
+        with self._collect_artifact_checksums():
+            for root, _, filenames in os.walk(local_dir):
+                if root == local_dir:
+                    artifact_dir = artifact_path
+                else:
+                    rel_path = os.path.relpath(root, local_dir)
+                    rel_path = relative_path_to_artifact_path(rel_path)
+                    artifact_dir = (
+                        posixpath.join(artifact_path, rel_path) if artifact_path else rel_path
+                    )
+                for f in filenames:
+                    self.log_artifact(os.path.join(root, f), artifact_dir)
 
     def list_artifacts(self, path=None):
         endpoint = "/mlflow-artifacts/artifacts"

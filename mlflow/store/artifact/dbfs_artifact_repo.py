@@ -134,18 +134,20 @@ class DbfsRestArtifactRepository(ArtifactRepository):
                 self._databricks_api_request(
                     endpoint=http_endpoint, method="POST", data=f, allow_redirects=False
                 )
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         artifact_path = artifact_path or ""
-        for dirpath, _, filenames in os.walk(local_dir):
-            artifact_subdir = artifact_path
-            if dirpath != local_dir:
-                rel_path = os.path.relpath(dirpath, local_dir)
-                rel_path = relative_path_to_artifact_path(rel_path)
-                artifact_subdir = posixpath.join(artifact_path, rel_path)
-            for name in filenames:
-                file_path = os.path.join(dirpath, name)
-                self.log_artifact(file_path, artifact_subdir)
+        with self._collect_artifact_checksums():
+            for dirpath, _, filenames in os.walk(local_dir):
+                artifact_subdir = artifact_path
+                if dirpath != local_dir:
+                    rel_path = os.path.relpath(dirpath, local_dir)
+                    rel_path = relative_path_to_artifact_path(rel_path)
+                    artifact_subdir = posixpath.join(artifact_path, rel_path)
+                for name in filenames:
+                    file_path = os.path.join(dirpath, name)
+                    self.log_artifact(file_path, artifact_subdir)
 
     def list_artifacts(self, path: str | None = None) -> list[FileInfo]:
         dbfs_path = self._get_dbfs_path(path) if path else self._get_dbfs_path("")

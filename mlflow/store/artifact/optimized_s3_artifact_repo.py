@@ -208,6 +208,7 @@ class OptimizedS3ArtifactRepository(CloudArtifactRepository):
             src_file_path=local_file,
             artifact_file_path=artifact_file_path,
         )
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def _get_write_credential_infos(self, remote_file_paths):
         """

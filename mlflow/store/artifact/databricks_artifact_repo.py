@@ -929,6 +929,7 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
             src_file_path=local_file,
             artifact_file_path=artifact_file_path,
         )
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def list_artifacts(self, path: str | None = None) -> list[FileInfo]:
         return self.resource.list_artifacts(path)

@@ -145,6 +145,7 @@ class AzureDataLakeArtifactRepository(CloudArtifactRepository):
         _retry_with_new_creds(
             try_func=try_func, creds_func=self._refresh_credentials, orig_creds=self.fs_client
         )
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def list_artifacts(self, path=None):
         directory_to_list = self.base_data_lake_directory

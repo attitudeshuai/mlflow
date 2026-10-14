@@ -132,6 +132,7 @@ class AzureBlobArtifactRepository(ArtifactRepository, MultipartUploadMixin):
             container_client.upload_blob(
                 dest_path, file, overwrite=True, timeout=self.write_timeout
             )
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         (container, _, dest_path, _) = self.parse_wasbs_uri(self.artifact_uri)
@@ -151,6 +152,7 @@ class AzureBlobArtifactRepository(ArtifactRepository, MultipartUploadMixin):
                     container_client.upload_blob(
                         remote_file_path, file, overwrite=True, timeout=self.write_timeout
                     )
+        self._record_local_dir_artifacts(local_dir, artifact_path)
 
     def list_artifacts(self, path=None):
         # Newer versions of `azure-storage-blob` (>= 12.4.0) provide a public

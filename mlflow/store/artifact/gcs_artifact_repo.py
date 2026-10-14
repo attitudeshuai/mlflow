@@ -113,6 +113,7 @@ class GCSArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         gcs_bucket = self._get_bucket(bucket)
         blob = gcs_bucket.blob(dest_path, chunk_size=self._GCS_UPLOAD_CHUNK_SIZE)
         blob.upload_from_filename(local_file, timeout=self._GCS_DEFAULT_TIMEOUT)
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         (bucket, dest_path) = self.parse_gcs_uri(self.artifact_uri)
@@ -143,6 +144,7 @@ class GCSArtifactRepository(ArtifactRepository, MultipartUploadMixin):
                 _retry_with_new_creds(
                     try_func=try_func, creds_func=self._refresh_credentials, orig_creds=gcs_bucket
                 )
+        self._record_local_dir_artifacts(local_dir, artifact_path)
 
     def list_artifacts(self, path=None):
         (bucket, artifact_path) = self.parse_gcs_uri(self.artifact_uri)

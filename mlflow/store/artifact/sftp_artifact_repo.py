@@ -89,6 +89,7 @@ class SFTPArtifactRepository(ArtifactRepository):
         with self.pool.get_sftp_connection() as sftp:
             sftp.makedirs(artifact_dir)
             sftp.put(local_file, posixpath.join(artifact_dir, os.path.basename(local_file)))
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         artifact_dir = posixpath.join(self.path, artifact_path) if artifact_path else self.path
@@ -98,6 +99,7 @@ class SFTPArtifactRepository(ArtifactRepository):
                 _put_r_for_windows(sftp, local_dir, artifact_dir)
             else:
                 sftp.put_r(local_dir, artifact_dir)
+        self._record_local_dir_artifacts(local_dir, artifact_path)
 
     def _is_directory(self, artifact_path):
         artifact_dir = self.path

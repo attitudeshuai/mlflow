@@ -49,6 +49,7 @@ class HdfsArtifactRepository(ArtifactRepository):
             with open(local_file, "rb") as source:
                 with hdfs.open_output_stream(destination_path) as destination:
                     shutil.copyfileobj(source, destination, length=ARTIFACT_STREAM_CHUNK_SIZE)
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         """
@@ -85,6 +86,7 @@ class HdfsArtifactRepository(ArtifactRepository):
                             shutil.copyfileobj(
                                 source, destination, length=ARTIFACT_STREAM_CHUNK_SIZE
                             )
+        self._record_local_dir_artifacts(local_dir, artifact_path)
 
     def list_artifacts(self, path=None):
         """

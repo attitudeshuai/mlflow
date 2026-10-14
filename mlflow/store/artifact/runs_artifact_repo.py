@@ -9,6 +9,10 @@ from mlflow.entities.logged_model import LoggedModel
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
 from mlflow.store.artifact.artifact_repo import ArtifactRepository
+from mlflow.store.artifact.checksum import (
+    ArtifactChecksumMismatchException,
+    ArtifactManifestMalformed,
+)
 from mlflow.utils.file_utils import create_tmp_dir
 from mlflow.utils.uri import (
     add_databricks_profile_info_to_artifact_uri,
@@ -211,6 +215,10 @@ class RunsArtifactRepository(ArtifactRepository):
         try:
             # This fails when the run has no artifacts, so we catch the exception
             run_out_path = self.repo.download_artifacts(artifact_path, dst_path)
+        except (ArtifactChecksumMismatchException, ArtifactManifestMalformed):
+            # Integrity failures must surface to the caller rather than being treated
+            # as "the run has no artifacts at this path".
+            raise
         except Exception:
             _logger.debug(
                 f"Failed to download artifacts from {self.artifact_uri}/{artifact_path}.",
@@ -222,6 +230,8 @@ class RunsArtifactRepository(ArtifactRepository):
         model_out_path: str | None = None
         try:
             model_out_path = self._download_model_artifacts(artifact_path, dst_path=dst_path)
+        except (ArtifactChecksumMismatchException, ArtifactManifestMalformed):
+            raise
         except Exception:
             _logger.debug(
                 f"Failed to download model artifacts from {self.artifact_uri}/{artifact_path}.",

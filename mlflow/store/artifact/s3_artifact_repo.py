@@ -367,6 +367,7 @@ class S3ArtifactRepository(
         self._upload_file(
             s3_client=self._get_s3_client(), local_file=local_file, bucket=bucket, key=dest_path
         )
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         """
@@ -402,6 +403,7 @@ class S3ArtifactRepository(
                     bucket=bucket,
                     key=posixpath.join(upload_path, f),
                 )
+        self._record_local_dir_artifacts(local_dir, artifact_path)
 
     def upload_archived_trace_data_bytes(self, data: bytes) -> None:
         from mlflow.tracing.otel.otel_archival import TRACE_ARCHIVAL_FILENAME

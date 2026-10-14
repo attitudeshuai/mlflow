@@ -10,6 +10,7 @@ from typing import NamedTuple
 from mlflow.environment_variables import (
     _MLFLOW_MPD_NUM_RETRIES,
     _MLFLOW_MPD_RETRY_INTERVAL_SECONDS,
+    MLFLOW_ARTIFACT_CHECKSUM_ENABLED,
     MLFLOW_ENABLE_MULTIPART_DOWNLOAD,
     MLFLOW_MULTIPART_DOWNLOAD_CHUNK_SIZE,
     MLFLOW_MULTIPART_DOWNLOAD_MINIMUM_FILE_SIZE,
@@ -172,6 +173,17 @@ class CloudArtifactRepository(ArtifactRepository):
                     "The following failures occurred while uploading one or more artifacts"
                     f" to {self.artifact_uri}: {failed_uploads}"
                 )
+            )
+
+        # All files uploaded successfully; aggregate their checksum manifest entries
+        # once. The instance-level manifest lock makes the read-modify-write safe
+        # against concurrent uploads on other threads of the same repository.
+        if MLFLOW_ARTIFACT_CHECKSUM_ENABLED.get():
+            self._record_artifact_sources(
+                {
+                    staged_upload.artifact_file_path: staged_upload.src_file_path
+                    for staged_upload in staged_uploads
+                }
             )
 
     @abstractmethod

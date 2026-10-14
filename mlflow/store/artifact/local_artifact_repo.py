@@ -168,6 +168,7 @@ class LocalArtifactRepository(ArtifactRepository, StreamUploadMixin):
             artifact_path,
             finalize_temp_path=lambda temp_file_path: shutil.copystat(local_file, temp_file_path),
         )
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifact_from_stream(
         self,
@@ -226,6 +227,7 @@ class LocalArtifactRepository(ArtifactRepository, StreamUploadMixin):
     def log_artifacts(self, local_dir, artifact_path=None):
         artifact_dir = self._get_or_create_artifact_dir(artifact_path)
         shutil_copytree_without_file_permissions(local_dir, artifact_dir)
+        self._record_local_dir_artifacts(local_dir, artifact_path)
 
     def download_artifacts(self, artifact_path, dst_path=None):
         """
@@ -237,14 +239,37 @@ class LocalArtifactRepository(ArtifactRepository, StreamUploadMixin):
             artifact_path: Relative source path to the desired artifacts.
             dst_path: Absolute path of the local filesystem destination directory to which to
                 download the specified artifacts. This directory must already exist. If
-                unspecified, the absolute path of the local artifact will be returned.
+                unspecified, the absolute path of the local artifact will be returned directly.
 
         Returns:
             Absolute path of the local filesystem location containing the desired artifacts.
         """
         if dst_path:
             return super().download_artifacts(artifact_path, dst_path)
-        return self.get_local_path(artifact_path)
+        # No bytes are copied; verify the existing local files in place against the manifest.
+        local_path = self.get_local_path(artifact_path)
+        self._verify_local_artifact_in_place(local_path)
+        return local_path
+
+    def _verify_local_artifact_in_place(self, local_path: str) -> None:
+        """Verify existing local artifact file(s) without copying them (dst_path is None)."""
+        if not self._artifact_checksum_enabled():
+            return
+        if os.path.isdir(local_path):
+            remote_to_local = {}
+            for dirpath, _, filenames in os.walk(local_path):
+                for name in filenames:
+                    if name.startswith(_TEMP_ARTIFACT_PREFIX):
+                        continue
+                    abs_path = os.path.join(dirpath, name)
+                    rel = os.path.relpath(abs_path, self.artifact_dir)
+                    remote_to_local[relative_path_to_artifact_path(rel)] = abs_path
+        else:
+            rel = os.path.relpath(local_path, self.artifact_dir)
+            remote_to_local = {relative_path_to_artifact_path(rel): local_path}
+        # No transfer occurred; re-downloading a local file onto itself is a no-op and
+        # fails on platforms that lock open files, so verification runs a single pass.
+        self._verify_or_skip(remote_to_local, max_attempts=1)
 
     def list_artifacts(self, path=None):
         if path:

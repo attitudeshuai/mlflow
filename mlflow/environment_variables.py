@@ -5,6 +5,7 @@ MLflow's environment variables adhere to the following naming conventions:
 - Internal-use variables: For variables used only internally, names start with `_MLFLOW_`
 """
 
+import hashlib
 import os
 import warnings
 from pathlib import Path
@@ -96,6 +97,45 @@ class _BooleanEnvironmentVariable(_EnvironmentVariable):
                 f"but got {val}"
             )
         return lowercased in ["true", "1"]
+
+
+class _ChecksumAlgorithmEnvironmentVariable(_EnvironmentVariable):
+    """
+    Represents an environment variable holding the name of a hashlib digest algorithm.
+    Invalid algorithm names are rejected when the variable is read.
+    """
+
+    def __init__(self, name, default):
+        super().__init__(name, str, default)
+
+    def get(self):
+        val = super().get()
+        if val is None:
+            return None
+        if val not in hashlib.algorithms_available:
+            raise ValueError(
+                f"{self.name} must be a digest algorithm supported by hashlib "
+                f"(see hashlib.algorithms_guaranteed), but got {val!r}"
+            )
+        return val
+
+
+class _ChoiceEnvironmentVariable(_EnvironmentVariable):
+    """
+    Represents a string environment variable that must be one of a fixed set of choices.
+    """
+
+    def __init__(self, name, choices, default):
+        super().__init__(name, str, default)
+        self.choices = choices
+
+    def get(self):
+        val = super().get()
+        if val is not None and val not in self.choices:
+            raise ValueError(
+                f"{self.name} must be one of {sorted(self.choices)}, but got {val!r}"
+            )
+        return val
 
 
 #: Specifies the tracking URI.
@@ -710,6 +750,40 @@ MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE = _EnvironmentVariable(
 #: (default: ``104_857_600`` (100 MB))
 MLFLOW_MULTIPART_DOWNLOAD_CHUNK_SIZE = _EnvironmentVariable(
     "MLFLOW_MULTIPART_DOWNLOAD_CHUNK_SIZE", int, 100 * 1024**2
+)
+
+#: Specifies whether content digest (checksum) verification is enabled for artifact
+#: uploads and downloads. When enabled, uploads record a manifest containing the size and
+#: digest of every uploaded file, and downloads verify each file against the manifest.
+#: Artifacts without a manifest are treated as unverified and this is reported, rather than
+#: treated as an error. When disabled (default), artifact transfers behave exactly as before.
+#: (default: ``False``)
+MLFLOW_ARTIFACT_CHECKSUM_ENABLED = _BooleanEnvironmentVariable(
+    "MLFLOW_ARTIFACT_CHECKSUM_ENABLED", False
+)
+
+#: Specifies the hashlib digest algorithm used when writing artifact checksum manifests.
+#: The value must name an algorithm available in ``hashlib.algorithms_available``; invalid
+#: names raise when the configuration is read.
+#: (default: ``"sha256"``)
+MLFLOW_ARTIFACT_CHECKSUM_ALGORITHM = _ChecksumAlgorithmEnvironmentVariable(
+    "MLFLOW_ARTIFACT_CHECKSUM_ALGORITHM", "sha256"
+)
+
+#: Specifies the behavior when checksum verification is enabled but the artifact repository
+#: cannot write or read a checksum manifest. ``"warn"`` logs a warning and proceeds without
+#: verification; ``"error"`` raises.
+#: (default: ``"warn"``)
+MLFLOW_ARTIFACT_CHECKSUM_UNSUPPORTED_POLICY = _ChoiceEnvironmentVariable(
+    "MLFLOW_ARTIFACT_CHECKSUM_UNSUPPORTED_POLICY", ("warn", "error"), "warn"
+)
+
+#: Specifies the total number of attempts (including the initial download) made for a file
+#: whose checksum does not match the manifest before its download is reported as failed.
+#: Only files that fail verification are re-downloaded.
+#: (default: ``3``)
+MLFLOW_ARTIFACT_CHECKSUM_MAX_ATTEMPTS = _EnvironmentVariable(
+    "MLFLOW_ARTIFACT_CHECKSUM_MAX_ATTEMPTS", int, 3
 )
 
 #: Specifies whether or not to allow the MLflow server to follow redirects when

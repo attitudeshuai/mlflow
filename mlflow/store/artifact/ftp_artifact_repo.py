@@ -75,23 +75,25 @@ class FTPArtifactRepository(ArtifactRepository):
             with open(local_file, "rb") as f:
                 ftp.cwd(artifact_dir)
                 ftp.storbinary("STOR " + os.path.basename(local_file), f)
+        self._record_uploaded_artifact(local_file, artifact_path)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         dest_path = posixpath.join(self.path, artifact_path) if artifact_path else self.path
 
         local_dir = os.path.abspath(local_dir)
-        for root, _, filenames in os.walk(local_dir):
-            upload_path = dest_path
-            if root != local_dir:
-                rel_path = os.path.relpath(root, local_dir)
-                rel_upload_path = relative_path_to_artifact_path(rel_path)
-                upload_path = posixpath.join(dest_path, rel_upload_path)
-            if not filenames:
-                with self.get_ftp_client() as ftp:
-                    self._mkdir(ftp, upload_path)
-            for f in filenames:
-                if os.path.isfile(os.path.join(root, f)):
-                    self.log_artifact(os.path.join(root, f), upload_path)
+        with self._collect_artifact_checksums():
+            for root, _, filenames in os.walk(local_dir):
+                upload_path = dest_path
+                if root != local_dir:
+                    rel_path = os.path.relpath(root, local_dir)
+                    rel_upload_path = relative_path_to_artifact_path(rel_path)
+                    upload_path = posixpath.join(dest_path, rel_upload_path)
+                if not filenames:
+                    with self.get_ftp_client() as ftp:
+                        self._mkdir(ftp, upload_path)
+                for f in filenames:
+                    if os.path.isfile(os.path.join(root, f)):
+                        self.log_artifact(os.path.join(root, f), upload_path)
 
     def _is_directory(self, artifact_path):
         artifact_dir = self.path
