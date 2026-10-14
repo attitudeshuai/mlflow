@@ -51,7 +51,7 @@ def write_yaml(root, file_name, data, overwrite=False, sort_keys=True, ensure_ya
         )
 
 
-def overwrite_yaml(root, file_name, data, ensure_yaml_extension=True):
+def overwrite_yaml(root, file_name, data, ensure_yaml_extension=True, tmp_root=None):
     """Safely overwrites a preexisting yaml file, ensuring that file contents are not deleted or
     corrupted if the write fails. This is achieved by writing contents to a temporary file
     and moving the temporary file to replace the preexisting file, rather than opening the
@@ -62,12 +62,16 @@ def overwrite_yaml(root, file_name, data, ensure_yaml_extension=True):
         file_name: File name.
         data: The data to write, represented as a dictionary.
         ensure_yaml_extension: If True, Will automatically add .yaml extension if not given.
+        tmp_root: Directory in which to create the temporary file. Defaults to the system
+            temporary directory. Passing the destination directory guarantees the temporary
+            file lives on the same filesystem as the target, so the replacement is an
+            atomic ``os.replace`` on every platform.
     """
     tmp_file_path = None
     original_file_path = os.path.join(root, file_name)
     original_file_mode = os.stat(original_file_path).st_mode
     try:
-        tmp_file_fd, tmp_file_path = tempfile.mkstemp(suffix="file.yaml")
+        tmp_file_fd, tmp_file_path = tempfile.mkstemp(suffix="file.yaml", dir=tmp_root)
         os.close(tmp_file_fd)
         write_yaml(
             root=get_parent_dir(tmp_file_path),
@@ -77,7 +81,13 @@ def overwrite_yaml(root, file_name, data, ensure_yaml_extension=True):
             sort_keys=True,
             ensure_yaml_extension=ensure_yaml_extension,
         )
-        shutil.move(tmp_file_path, original_file_path)
+        tmp_in_same_dir = os.path.abspath(tmp_root or "") == os.path.dirname(
+            os.path.abspath(original_file_path)
+        )
+        if tmp_in_same_dir:
+            os.replace(tmp_file_path, original_file_path)
+        else:
+            shutil.move(tmp_file_path, original_file_path)
         # restores original file permissions, see https://docs.python.org/3/library/tempfile.html#tempfile.mkstemp
         os.chmod(original_file_path, original_file_mode)
     finally:

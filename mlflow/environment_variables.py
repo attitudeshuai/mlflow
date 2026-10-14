@@ -1913,6 +1913,38 @@ MLFLOW_LOG_UV_FILES = _BooleanEnvironmentVariable("MLFLOW_LOG_UV_FILES", True)
 MLFLOW_ALLOW_FILE_STORE = _BooleanEnvironmentVariable("MLFLOW_ALLOW_FILE_STORE", False)
 
 
+#: Specifies whether to enable optional cross-process write protection for the filesystem
+#: tracking backend. When enabled, read-modify-write operations on run/experiment metadata,
+#: metric/param appends and experiment delete/restore are serialized with per-directory
+#: file locks. When disabled, the file layout and read/write behavior are unchanged.
+#: (default: ``False``)
+MLFLOW_FILE_STORE_WRITE_PROTECTION_ENABLED = _BooleanEnvironmentVariable(
+    "MLFLOW_FILE_STORE_WRITE_PROTECTION_ENABLED", False
+)
+
+#: Maximum number of seconds to wait for a cross-process write lock held by another process
+#: before raising an error. Must be a positive number.
+#: (default: ``30``)
+MLFLOW_FILE_STORE_LOCK_TIMEOUT_SECONDS = _EnvironmentVariable(
+    "MLFLOW_FILE_STORE_LOCK_TIMEOUT_SECONDS", float, 30.0
+)
+
+#: Grace period in seconds after which a lock left behind by a crashed process is considered
+#: stale and reclaimed. Must be zero or a positive number.
+#: (default: ``300``)
+MLFLOW_FILE_STORE_LOCK_STALE_GRACE_SECONDS = _EnvironmentVariable(
+    "MLFLOW_FILE_STORE_LOCK_STALE_GRACE_SECONDS", float, 300.0
+)
+
+#: Behavior when write protection is enabled but the backing filesystem does not support
+#: the required file locking semantics (e.g. a read-only filesystem). ``error`` raises at
+#: startup, ``disable`` logs a warning and degrades to the unlocked behavior.
+#: (default: ``"error"``)
+MLFLOW_FILE_STORE_LOCK_UNSUPPORTED_POLICY = _EnvironmentVariable(
+    "MLFLOW_FILE_STORE_LOCK_UNSUPPORTED_POLICY", str, "error"
+)
+
+
 #: Specifies whether to skip the pip requirements compatibility check when saving or logging
 #: a model. When set to ``True``, MLflow will not run ``pip install --dry-run`` to validate
 #: that the provided pip requirements are mutually compatible. This is useful in air-gapped
