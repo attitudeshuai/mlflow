@@ -21,6 +21,15 @@ MLFLOW_GIT_DIRTY = "mlflow.source.git.dirty"
 MLFLOW_GIT_REPO_URL = "mlflow.source.git.repoURL"
 MLFLOW_GIT_DIFF = "mlflow.source.git.diff"
 MLFLOW_LOGGED_MODELS = "mlflow.log-model.history"
+
+# Liveness tags. The heartbeat timestamp is written periodically by the client while a run is
+# alive. The suspected-zombie marker is managed by the store on read when stale runs are detected.
+# The finalized reason records why a run was automatically finalized by the store.
+MLFLOW_LAST_HEARTBEAT_TIME = "mlflow.lastHeartbeatTime"
+MLFLOW_RUN_SUSPECTED_ZOMBIE = "mlflow.suspectedZombie"
+MLFLOW_RUN_FINALIZED_REASON = "mlflow.runFinalizedReason"
+MLFLOW_RUN_FINALIZED_REASON_HEARTBEAT_TIMEOUT = "heartbeat_timeout"
+
 MLFLOW_MODEL_IS_EXTERNAL = "mlflow.model.isExternal"
 MLFLOW_MODEL_VERSIONS = "mlflow.modelVersions"
 MLFLOW_PROJECT_ENV = "mlflow.project.env"

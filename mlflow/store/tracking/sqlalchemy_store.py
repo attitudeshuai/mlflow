@@ -260,6 +260,7 @@ from mlflow.utils.file_utils import local_file_uri_to_path
 from mlflow.utils.mlflow_tags import (
     MLFLOW_ARTIFACT_LOCATION,
     MLFLOW_DATASET_CONTEXT,
+    MLFLOW_LAST_HEARTBEAT_TIME,
     MLFLOW_LOGGED_MODELS,
     MLFLOW_RUN_NAME,
     MLFLOW_USER,
@@ -1297,12 +1298,49 @@ class SqlAlchemyStore(SqlAlchemyMCPServerRegistryMixin, SqlAlchemyGatewayStoreMi
             inputs = self._get_run_inputs(run_uuids=[run_id], session=session)[0]
             model_inputs = self._get_model_inputs(run_id, session)
             model_outputs = self._get_model_outputs(run_id, session)
-            return Run(
+            mlflow_run = Run(
                 mlflow_run.info,
                 mlflow_run.data,
                 RunInputs(dataset_inputs=inputs, model_inputs=model_inputs),
                 RunOutputs(model_outputs),
             )
+        self._evaluate_runs_liveness([mlflow_run])
+        return mlflow_run
+
+    def record_run_heartbeat(self, run_id, heartbeat_time_ms=None):
+        """
+        Record a heartbeat with a single lightweight tag upsert in its own session. The write is
+        independent of metrics/params tables and sessions, so heartbeats cannot block or be
+        blocked by metric/param logging. Late heartbeats for runs that are no longer
+        active/running are ignored.
+        """
+        _validate_run_id(run_id)
+        heartbeat_time_ms = heartbeat_time_ms or get_current_time_millis()
+        with self.ManagedSessionMaker(read_only=False) as session:
+            active_run = (
+                self._get_query(session, SqlRun)
+                .filter(
+                    SqlRun.run_uuid == run_id,
+                    SqlRun.status == RunStatus.to_string(RunStatus.RUNNING),
+                    SqlRun.lifecycle_stage == LifecycleStage.ACTIVE,
+                )
+                .one_or_none()
+            )
+            if active_run is None:
+                return
+            session.merge(
+                SqlTag(
+                    run_uuid=run_id,
+                    key=MLFLOW_LAST_HEARTBEAT_TIME,
+                    value=str(heartbeat_time_ms),
+                )
+            )
+
+    def _force_set_run_tag(self, run_id, tag):
+        """Upsert a run tag without requiring the run to be active (auto-finalization path)."""
+        with self.ManagedSessionMaker(read_only=False) as session:
+            self._get_run(run_uuid=run_id, session=session)
+            session.merge(SqlTag(run_uuid=run_id, key=tag.key, value=tag.value))
 
     def restore_run(self, run_id):
         with self.ManagedSessionMaker(read_only=False) as session:

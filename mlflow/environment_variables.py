@@ -677,6 +677,38 @@ MLFLOW_SYSTEM_METRICS_SAMPLES_BEFORE_LOGGING = _EnvironmentVariable(
 #: training) setup.
 MLFLOW_SYSTEM_METRICS_NODE_ID = _EnvironmentVariable("MLFLOW_SYSTEM_METRICS_NODE_ID", str, None)
 
+#: Specifies whether the client periodically writes run heartbeats while a run is active.
+#: (default: ``True``)
+MLFLOW_ENABLE_RUN_HEARTBEAT = _BooleanEnvironmentVariable("MLFLOW_ENABLE_RUN_HEARTBEAT", True)
+
+#: Specifies the interval in seconds at which the client writes a run heartbeat while the run
+#: is active. Must be a positive integer.
+#: (default: ``30``)
+MLFLOW_RUN_HEARTBEAT_INTERVAL_SECONDS = _EnvironmentVariable(
+    "MLFLOW_RUN_HEARTBEAT_INTERVAL_SECONDS", int, 30
+)
+
+#: Specifies the stale detection window in seconds. A running run whose last heartbeat is older
+#: than the window is suspected to be zombie. Must be a positive integer.
+#: (default: ``120``)
+MLFLOW_RUN_STALE_TIMEOUT_SECONDS = _EnvironmentVariable(
+    "MLFLOW_RUN_STALE_TIMEOUT_SECONDS", int, 120
+)
+
+#: Specifies the disposition policy for stale runs: ``"mark"`` only flags the run in query
+#: results; ``"fail"`` automatically marks the run as failed with the last heartbeat time as the
+#: end time and records the finalization reason.
+#: (default: ``"mark"``)
+MLFLOW_RUN_STALE_POLICY = _EnvironmentVariable("MLFLOW_RUN_STALE_POLICY", str, "mark")
+
+#: Specifies the stale detection window in seconds applied to runs that never wrote a heartbeat
+#: (old clients and historical data). A value of ``0`` disables detection for such runs, keeping
+#: the legacy semantics. When enabled, the value must be at least ``MLFLOW_RUN_STALE_TIMEOUT``.
+#: (default: ``0``)
+MLFLOW_RUN_LEGACY_STALE_TIMEOUT_SECONDS = _EnvironmentVariable(
+    "MLFLOW_RUN_LEGACY_STALE_TIMEOUT_SECONDS", int, 0
+)
+
 
 # Private environment variable to specify the number of chunk download retries for multipart
 # download.

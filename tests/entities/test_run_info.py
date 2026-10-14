@@ -57,6 +57,8 @@ def test_creation_and_hydration(run_info):
         "end_time": end_time,
         "lifecycle_stage": lifecycle_stage,
         "artifact_uri": artifact_uri,
+        "last_heartbeat_time": None,
+        "suspected_zombie": False,
     }
     assert dict(ri1) == as_dict
 

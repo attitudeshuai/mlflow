@@ -40,6 +40,7 @@ from mlflow.environment_variables import (
     _MLFLOW_ENABLE_UC_TRACE_UPSELL,
     MLFLOW_ACTIVE_MODEL_ID,
     MLFLOW_ENABLE_ASYNC_LOGGING,
+    MLFLOW_ENABLE_RUN_HEARTBEAT,
     MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING,
     MLFLOW_EXPERIMENT_ID,
     MLFLOW_EXPERIMENT_NAME,
@@ -52,6 +53,7 @@ from mlflow.protos.databricks_pb2 import (
     RESOURCE_DOES_NOT_EXIST,
 )
 from mlflow.store.tracking import SEARCH_MAX_RESULTS_DEFAULT
+from mlflow.store.tracking.run_liveness import get_heartbeat_interval_seconds
 from mlflow.telemetry.events import AutologgingEvent
 from mlflow.telemetry.track import _record_event
 from mlflow.tracing.provider import (
@@ -123,6 +125,11 @@ _logger = logging.getLogger(__name__)
 
 
 run_id_to_system_metrics_monitor = {}
+
+#: Active run heartbeat monitors keyed by run ID. Heartbeats stop on ``end_run``; if the process
+#: is killed instead, the daemon thread dies with the process and heartbeats simply stop, which
+#: the store detects as staleness.
+run_id_to_run_heartbeat = {}
 
 
 _active_run_stack = ThreadLocalVariable(default_factory=lambda: [])
@@ -711,6 +718,29 @@ def start_run(
         except Exception as e:
             _logger.error(f"Failed to start system metrics monitoring: {e}.")
 
+    if MLFLOW_ENABLE_RUN_HEARTBEAT.get():
+        # Read/validate the interval before starting anything so invalid configuration raises at
+        # configuration parse time (instead of being swallowed as a heartbeat failure).
+        heartbeat_interval = get_heartbeat_interval_seconds()
+        # If this run is being resumed after a previous heartbeat was stopped (or restarted),
+        # make sure the old monitor does not keep writing.
+        if old_heartbeat := run_id_to_run_heartbeat.pop(active_run_obj.info.run_id, None):
+            with contextlib.suppress(Exception):
+                old_heartbeat.finish()
+        try:
+            from mlflow.tracking.run_heartbeat import RunHeartbeat
+
+            heartbeat = RunHeartbeat(
+                run_id=active_run_obj.info.run_id,
+                interval_seconds=heartbeat_interval,
+            )
+            heartbeat.start()
+            run_id_to_run_heartbeat[active_run_obj.info.run_id] = heartbeat
+        except Exception as e:
+            # Heartbeating is best-effort: a failure to start monitoring must not break run
+            # startup. Heartbeat write failures themselves are swallowed inside the thread.
+            _logger.warning(f"Failed to start run heartbeat: {e}.")
+
     active_run_stack.append(ActiveRun(active_run_obj))
     return active_run_stack[-1]
 
@@ -754,6 +784,11 @@ def end_run(status: str = RunStatus.to_string(RunStatus.FINISHED)) -> None:
         run = active_run_stack.pop()
         last_active_run_id = run.info.run_id
         _last_active_run_id.set(last_active_run_id)
+        # Stop heartbeating before the run is terminated, so no late heartbeat can race with
+        # the end-run status update.
+        if run_heartbeat := run_id_to_run_heartbeat.pop(last_active_run_id, None):
+            with contextlib.suppress(Exception):
+                run_heartbeat.finish()
         MlflowClient().set_terminated(last_active_run_id, status)
         if last_active_run_id in run_id_to_system_metrics_monitor:
             system_metrics_monitor = run_id_to_system_metrics_monitor.pop(last_active_run_id)

@@ -47,6 +47,8 @@ class RunInfo(_MlflowObject):
         lifecycle_stage: str,
         artifact_uri: str | None = None,
         run_name: str | None = None,
+        last_heartbeat_time: int | None = None,
+        suspected_zombie: bool = False,
     ) -> None:
         if experiment_id is None:
             raise Exception("experiment_id cannot be None")
@@ -65,6 +67,10 @@ class RunInfo(_MlflowObject):
         self._lifecycle_stage = lifecycle_stage
         self._artifact_uri = artifact_uri
         self._run_name = run_name
+        # Liveness metadata is hydrated from system tags by the tracking stores; it is not part
+        # of the RunInfo protobuf contract.
+        self._last_heartbeat_time = last_heartbeat_time
+        self._suspected_zombie = suspected_zombie
 
     def __eq__(self, other: object) -> bool:
         if type(other) is type(self):
@@ -138,6 +144,35 @@ class RunInfo(_MlflowObject):
         describing the lifecycle stage of the run.
         """
         return self._lifecycle_stage
+
+    @property
+    def last_heartbeat_time(self) -> int | None:
+        """
+        Time of the last heartbeat received while the run was active, in number of milliseconds
+        since the UNIX epoch. ``None`` if no heartbeat was ever recorded (e.g. the run was
+        created by an old client that does not emit heartbeats).
+        """
+        return self._last_heartbeat_time
+
+    @property
+    def suspected_zombie(self) -> bool:
+        """
+        ``True`` if the run is still in the RUNNING state but its last heartbeat is older than
+        the configured stale timeout, so it is suspected to be zombie (its process died without
+        ending the run). This flag is derived from the persisted run metadata on every read and
+        is not a new run status.
+        """
+        return self._suspected_zombie
+
+    def _set_liveness(self, last_heartbeat_time: int | None, suspected_zombie: bool) -> None:
+        """Update the in-memory liveness view of the run info after reading persisted metadata."""
+        self._last_heartbeat_time = last_heartbeat_time
+        self._suspected_zombie = suspected_zombie
+
+    def _set_status_and_end_time(self, status: str, end_time: int | None) -> None:
+        """Update the in-memory status/end time after the store finalizes the run."""
+        self._status = status
+        self._end_time = end_time
 
     def to_proto(self) -> ProtoRunInfo:
         proto = ProtoRunInfo()

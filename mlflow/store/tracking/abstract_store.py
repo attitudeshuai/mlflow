@@ -1,6 +1,7 @@
 import asyncio
 import bisect
 import json
+import logging
 from abc import ABCMeta, abstractmethod
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -18,6 +19,8 @@ from mlflow.entities import (
     LoggedModelParameter,
     LoggedModelStatus,
     LoggedModelTag,
+    RunStatus,
+    RunTag,
     ScorerVersion,
     ViewType,
 )
@@ -51,12 +54,20 @@ from mlflow.store.tracking import (
 )
 from mlflow.store.tracking.gateway import GatewayStoreMixin
 from mlflow.store.tracking.mcp_server_registry import MCPServerRegistryMixin
+from mlflow.store.tracking.run_liveness import (
+    LivenessAction,
+    get_run_liveness_config,
+    hydrate_run_liveness,
+    judge_run_liveness,
+)
 from mlflow.store.workspace.abstract_store import ResolvedTraceArchivalConfig
 from mlflow.tracing.analysis import TraceFilterCorrelationResult
 from mlflow.utils import mlflow_tags
 from mlflow.utils.annotations import developer_stable, requires_sql_backend
 from mlflow.utils.async_logging.async_logging_queue import AsyncLoggingQueue
 from mlflow.utils.async_logging.run_operations import RunOperations
+
+_logger = logging.getLogger(__name__)
 
 
 @developer_stable
@@ -264,6 +275,35 @@ class AbstractStore(MCPServerRegistryMixin, GatewayStoreMixin):
         Returns:
             The created Run object
         """
+
+    def record_run_heartbeat(self, run_id, heartbeat_time_ms=None):
+        """
+        Record a lightweight heartbeat for an active run.
+
+        The client calls this periodically while the run is alive so that the store can
+        distinguish a live run from a zombie run after the client process is killed or loses
+        power. Heartbeats only touch the heartbeat tag; they do not go through metric/parameter
+        logging and must not block it. A heartbeat for a run that is no longer active is a
+        no-op. Backends that do not implement this API raise ``NotImplementedError``; callers
+        are expected to treat heartbeat failures as non-fatal.
+
+        Args:
+            run_id: String id for the run.
+            heartbeat_time_ms: Heartbeat timestamp in milliseconds since the UNIX epoch.
+                Defaults to the current time.
+        """
+        raise NotImplementedError(self.__class__.__name__)
+
+    def _force_set_run_tag(self, run_id, tag):
+        """
+        Persist a run tag without the "run must be active" guard.
+
+        Automatic stale-run finalization transitions the run to a terminal status first and
+        records the finalization reason afterwards, so the regular ``set_tag`` path (which
+        rejects tags on non-active runs) cannot be used. Only stores that persist liveness
+        state need this method.
+        """
+        raise NotImplementedError(self.__class__.__name__)
 
     @abstractmethod
     def delete_run(self, run_id):
@@ -1100,7 +1140,95 @@ class AbstractStore(MCPServerRegistryMixin, GatewayStoreMixin):
             order_by,
             page_token,
         )
+        self._postprocess_searched_runs(runs)
         return PagedList(runs, token)
+
+    # Whether this store performs stale-run detection itself on read. Local stores do; the REST
+    # store only hydrates liveness fields from tags because the remote server runs detection.
+    _persist_liveness_on_read = True
+
+    def _postprocess_searched_runs(self, runs):
+        if self._persist_liveness_on_read:
+            self._evaluate_runs_liveness(runs)
+        else:
+            for run in runs:
+                hydrate_run_liveness(run)
+
+    def _evaluate_single_run_liveness(self, run, config):
+        """Apply the stale-run verdict for one run, swallowing transition failures.
+
+        Read paths must never fail because a liveness transition (e.g. an auto-fail racing with a
+        client's end-run call) failed; such errors are logged and the liveness fields are still
+        hydrated from whatever metadata is currently persisted.
+        """
+        verdict = judge_run_liveness(run, config)
+        run_id = run.info.run_id
+        tags = run.data.tags if run.data else {}
+        action = verdict.action
+
+        if action == LivenessAction.HEALTHY:
+            if mlflow_tags.MLFLOW_RUN_SUSPECTED_ZOMBIE in tags:
+                # A previously stale run caught up: clear the marker so it disappears without
+                # leaving an erroneous state.
+                try:
+                    self.delete_tag(run_id, mlflow_tags.MLFLOW_RUN_SUSPECTED_ZOMBIE)
+                    tags.pop(mlflow_tags.MLFLOW_RUN_SUSPECTED_ZOMBIE, None)
+                except Exception:
+                    _logger.debug(
+                        "Failed to clear stale marker for run %s", run_id, exc_info=True
+                    )
+        elif action == LivenessAction.MARK_STALE:
+            if mlflow_tags.MLFLOW_RUN_SUSPECTED_ZOMBIE not in tags:
+                try:
+                    self.set_tag(
+                        run_id, RunTag(mlflow_tags.MLFLOW_RUN_SUSPECTED_ZOMBIE, "true")
+                    )
+                    tags[mlflow_tags.MLFLOW_RUN_SUSPECTED_ZOMBIE] = "true"
+                except Exception:
+                    _logger.debug(
+                        "Failed to mark stale run %s as suspected zombie", run_id, exc_info=True
+                    )
+        elif action == LivenessAction.FAIL_STALE:
+            try:
+                if mlflow_tags.MLFLOW_RUN_SUSPECTED_ZOMBIE in tags:
+                    self.delete_tag(run_id, mlflow_tags.MLFLOW_RUN_SUSPECTED_ZOMBIE)
+                    tags.pop(mlflow_tags.MLFLOW_RUN_SUSPECTED_ZOMBIE, None)
+                # Transition first while the run is still active, then record the reason without
+                # the active-run guard. The run must not be re-finalized if it was concurrently
+                # ended by the client (update_run_info raises in that case).
+                self.update_run_info(run_id, RunStatus.FAILED, verdict.end_time_ms, None)
+                reason_tag = RunTag(
+                    mlflow_tags.MLFLOW_RUN_FINALIZED_REASON,
+                    mlflow_tags.MLFLOW_RUN_FINALIZED_REASON_HEARTBEAT_TIMEOUT,
+                )
+                self._force_set_run_tag(run_id, reason_tag)
+                tags[reason_tag.key] = reason_tag.value
+                run.info._set_status_and_end_time(
+                    RunStatus.to_string(RunStatus.FAILED), verdict.end_time_ms
+                )
+            except Exception:
+                _logger.debug(
+                    "Failed to auto-finalize stale run %s as failed", run_id, exc_info=True
+                )
+
+        hydrate_run_liveness(run)
+
+    def _evaluate_runs_liveness(self, runs):
+        """Detect stale runs, persist the configured disposition, and hydrate liveness fields."""
+        if not runs:
+            return
+        # Reading the config here raises ValueError on invalid values, i.e. configuration
+        # problems surface at parse time rather than silently disabling detection.
+        config = get_run_liveness_config()
+        for run in runs:
+            try:
+                self._evaluate_single_run_liveness(run, config)
+            except Exception:
+                _logger.debug(
+                    "Failed to evaluate liveness for run %s",
+                    run.info.run_id if run and run.info else "<unknown>",
+                    exc_info=True,
+                )
 
     @abstractmethod
     def _search_runs(

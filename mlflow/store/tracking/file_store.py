@@ -90,6 +90,7 @@ from mlflow.utils.file_utils import (
 from mlflow.utils.mlflow_tags import (
     MLFLOW_ARTIFACT_LOCATION,
     MLFLOW_DATASET_CONTEXT,
+    MLFLOW_LAST_HEARTBEAT_TIME,
     MLFLOW_LOGGED_MODELS,
     MLFLOW_RUN_NAME,
     _get_run_name_from_tags,
@@ -150,6 +151,9 @@ def _make_persisted_run_info_dict(run_info):
     # 'tags' was moved from RunInfo to RunData, so we must keep storing it in the meta.yaml for
     # old mlflow versions to read
     run_info_dict = dict(run_info)
+    # Liveness fields are derived from run tags on read, they must not be persisted in meta.yaml.
+    run_info_dict.pop("last_heartbeat_time", None)
+    run_info_dict.pop("suspected_zombie", None)
     run_info_dict["tags"] = []
     if "status" in run_info_dict:
         # 'status' is stored as an integer enum in meta file, but RunInfo.status field is a string.
@@ -788,7 +792,29 @@ class FileStore(AbstractStore):
                 f"Run '{run_id}' metadata is in invalid state.",
                 databricks_pb2.INVALID_STATE,
             )
-        return self._get_run_from_info(run_info)
+        run = self._get_run_from_info(run_info)
+        self._evaluate_runs_liveness([run])
+        return run
+
+    def record_run_heartbeat(self, run_id, heartbeat_time_ms=None):
+        """
+        Record a heartbeat for the run by writing a single small tag file. Heartbeats never go
+        through metrics/params logging, so they cannot block it. Late heartbeats for runs that
+        are no longer active/running are ignored.
+        """
+        _validate_run_id(run_id)
+        run_info = self._get_run_info(run_id)
+        if run_info.lifecycle_stage != LifecycleStage.ACTIVE:
+            return
+        if RunStatus.from_string(run_info.status) != RunStatus.RUNNING:
+            return
+        heartbeat_time_ms = heartbeat_time_ms or get_current_time_millis()
+        self._set_run_tag(run_info, RunTag(MLFLOW_LAST_HEARTBEAT_TIME, str(heartbeat_time_ms)))
+
+    def _force_set_run_tag(self, run_id, tag):
+        """Write a run tag without requiring the run to be active (used by auto-finalization)."""
+        run_info = self._get_run_info(run_id)
+        self._set_run_tag(run_info, tag)
 
     def _get_run_from_info(self, run_info):
         metrics = self._get_all_metrics(run_info)

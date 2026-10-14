@@ -468,6 +468,26 @@ class MlflowClient:
         """
         return self._tracking_client.get_run(run_id)
 
+    def record_run_heartbeat(self, run_id: str, heartbeat_time_ms: int | None = None) -> None:
+        """
+        Record a liveness heartbeat for the run with the specified ID.
+
+        MLflow writes a heartbeat periodically while a run is active (see
+        ``MLFLOW_ENABLE_RUN_HEARTBEAT`` and ``MLFLOW_RUN_HEARTBEAT_INTERVAL_SECONDS``). If the run
+        process is killed or loses power, the tracking store uses the heartbeat freshness to flag
+        the stale run as a suspected zombie (or to automatically mark it failed, depending on the
+        ``MLFLOW_RUN_STALE_POLICY`` setting). Heartbeat failures are non-fatal and normally only
+        need to be handled by MLflow itself.
+
+        Args:
+            run_id: String ID of the run.
+            heartbeat_time_ms: Heartbeat timestamp in milliseconds since the UNIX epoch.
+                Defaults to the current time.
+        """
+        self._tracking_client.record_run_heartbeat(
+            run_id, heartbeat_time_ms=heartbeat_time_ms
+        )
+
     def get_parent_run(self, run_id: str) -> Run | None:
         """Gets the parent run for the given run id if one exists.
 

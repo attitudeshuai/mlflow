@@ -159,6 +159,7 @@ from mlflow.store.tracking import MAX_RESULTS_QUERY_TRACE_METRICS, SEARCH_TRACES
 from mlflow.store.tracking.abstract_store import AbstractStore
 from mlflow.store.tracking.gateway.rest_mixin import RestGatewayStoreMixin
 from mlflow.store.tracking.mcp_server_registry.rest_mixin import RestMCPServerRegistryMixin
+from mlflow.store.tracking.run_liveness import hydrate_run_liveness
 from mlflow.store.workspace_rest_store_mixin import WorkspaceRestStoreMixin
 from mlflow.tracing.analysis import TraceFilterCorrelationResult
 from mlflow.tracing.utils.otlp import (
@@ -167,6 +168,7 @@ from mlflow.tracing.utils.otlp import (
     resource_to_otel_proto,
 )
 from mlflow.utils.databricks_utils import databricks_api_disabled
+from mlflow.utils.mlflow_tags import MLFLOW_LAST_HEARTBEAT_TIME
 from mlflow.utils.proto_json_utils import message_to_json
 from mlflow.utils.rest_utils import (
     _REST_API_PATH_PREFIX,
@@ -185,6 +187,7 @@ from mlflow.utils.rest_utils import (
     http_request,
     verify_rest_response,
 )
+from mlflow.utils.time import get_current_time_millis
 from mlflow.utils.validation import _resolve_experiment_ids_and_locations
 
 _logger = logging.getLogger(__name__)
@@ -212,6 +215,10 @@ class RestStore(
 
     # Set of v3 APIs - includes Gateway APIs from mixin
     _V3_APIS = RestGatewayStoreMixin._V3_GATEWAY_APIS
+
+    # Stale-run detection runs on the remote server; the REST client only hydrates liveness
+    # fields from the tags returned by get/search responses.
+    _persist_liveness_on_read = False
 
     def __init__(self, get_host_creds):
         super().__init__()
@@ -361,7 +368,25 @@ class RestStore(
         """
         req_body = message_to_json(GetRun(run_uuid=run_id, run_id=run_id))
         response_proto = self._call_endpoint(GetRun, req_body)
-        return Run.from_proto(response_proto.run)
+        run = Run.from_proto(response_proto.run)
+        # Detection happens on the remote server; only hydrate liveness fields from tags.
+        return hydrate_run_liveness(run)
+
+    def record_run_heartbeat(self, run_id, heartbeat_time_ms=None):
+        """
+        Record a run heartbeat as a single SetTag request. The request is independent of
+        metric/parameter logging and is cheap enough to run on the client's heartbeat thread.
+        """
+        heartbeat_time_ms = heartbeat_time_ms or get_current_time_millis()
+        req_body = message_to_json(
+            SetTag(
+                run_uuid=run_id,
+                run_id=run_id,
+                key=MLFLOW_LAST_HEARTBEAT_TIME,
+                value=str(heartbeat_time_ms),
+            )
+        )
+        self._call_endpoint(SetTag, req_body)
 
     def update_run_info(self, run_id, run_status, end_time, run_name):
         """Updates the metadata of the specified run."""

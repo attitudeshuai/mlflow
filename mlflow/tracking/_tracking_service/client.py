@@ -120,6 +120,15 @@ class TrackingServiceClient:
         _validate_run_id(run_id)
         return self.store.get_run(run_id)
 
+    def record_run_heartbeat(self, run_id, heartbeat_time_ms=None):
+        """Record a liveness heartbeat for an active run. See
+        :meth:`mlflow.store.tracking.abstract_store.AbstractStore.record_run_heartbeat`.
+        """
+        _validate_run_id(run_id)
+        return self.store.record_run_heartbeat(
+            run_id, heartbeat_time_ms=heartbeat_time_ms
+        )
+
     def get_metric_history(self, run_id, key):
         """Return a list of metric objects corresponding to all values logged for a given metric.
 

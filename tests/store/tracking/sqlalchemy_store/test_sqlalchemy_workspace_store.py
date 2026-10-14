@@ -48,6 +48,8 @@ from mlflow.entities.trace_state import TraceState
 from mlflow.entities.workspace import TraceArchivalConfig
 from mlflow.environment_variables import (
     MLFLOW_ENABLE_WORKSPACES,
+    MLFLOW_RUN_HEARTBEAT_INTERVAL_SECONDS,
+    MLFLOW_RUN_STALE_TIMEOUT_SECONDS,
     MLFLOW_SQL_TRACE_ROLLUPS_ENABLED,
     MLFLOW_TRACE_ARCHIVAL_CONFIG,
 )
@@ -74,7 +76,7 @@ from mlflow.tracing.constant import SpanAttributeKey, TraceMetadataKey, TraceMet
 from mlflow.tracing.utils import generate_request_id_v2
 from mlflow.tracking._tracking_service import utils as tracking_utils
 from mlflow.tracking._tracking_service.client import TrackingServiceClient
-from mlflow.utils.mlflow_tags import MLFLOW_DATASET_CONTEXT
+from mlflow.utils.mlflow_tags import MLFLOW_DATASET_CONTEXT, MLFLOW_RUN_SUSPECTED_ZOMBIE
 from mlflow.utils.uri import append_to_uri_path
 from mlflow.utils.workspace_context import WorkspaceContext
 from mlflow.utils.workspace_utils import DEFAULT_WORKSPACE_NAME
@@ -124,6 +126,44 @@ def workspace_tracking_store(tmp_path, db_uri, monkeypatch):
         yield store
     finally:
         store._dispose_engine()
+
+
+def test_workspace_store_run_heartbeat_and_zombie_detection(
+    workspace_tracking_store, monkeypatch
+):
+    monkeypatch.setenv(MLFLOW_RUN_HEARTBEAT_INTERVAL_SECONDS.name, "2")
+    monkeypatch.setenv(MLFLOW_RUN_STALE_TIMEOUT_SECONDS.name, "10")
+    import mlflow.store.tracking.run_liveness as run_liveness_module
+
+    clock = {"now": _now_ms()}
+    monkeypatch.setattr(
+        run_liveness_module, "get_current_time_millis", lambda: clock["now"]
+    )
+
+    store = workspace_tracking_store
+    with WorkspaceContext("ws-a"):
+        exp_id, run = _create_run(store, "ws-a", "heartbeat-exp", "run")
+        run_id = run.info.run_id
+
+        store.record_run_heartbeat(run_id, clock["now"])
+        assert store.get_run(run_id).info.last_heartbeat_time == clock["now"]
+        assert store.get_run(run_id).info.suspected_zombie is False
+
+        clock["now"] += 20_000
+        stale = store.get_run(run_id)
+        assert stale.info.status == "RUNNING"
+        assert stale.info.suspected_zombie is True
+        assert stale.data.tags[MLFLOW_RUN_SUSPECTED_ZOMBIE] == "true"
+        searched = store.search_runs([exp_id], "", ViewType.ACTIVE_ONLY)
+        assert len(searched) == 1
+        assert searched[0].info.suspected_zombie is True
+
+        # A recovered heartbeat clears the marker within the same workspace.
+        clock["now"] += 1_000
+        store.record_run_heartbeat(run_id, clock["now"])
+        recovered = store.get_run(run_id)
+        assert recovered.info.suspected_zombie is False
+        assert MLFLOW_RUN_SUSPECTED_ZOMBIE not in recovered.data.tags
 
 
 def test_sqlalchemy_store_returns_workspace_aware_when_enabled(tmp_path, db_uri, monkeypatch):
