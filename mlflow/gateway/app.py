@@ -47,6 +47,11 @@ from mlflow.gateway.constants import (
     MLFLOW_GATEWAY_SEARCH_ROUTES_PAGE_SIZE,
     MLFLOW_QUERY_SUFFIX,
 )
+from mlflow.gateway.health import (
+    RouteHealthModel,
+    snapshot_disabled_route,
+    snapshot_enabled_route,
+)
 from mlflow.gateway.providers import get_provider
 from mlflow.gateway.schemas import chat, completions, embeddings
 from mlflow.gateway.utils import (
@@ -107,6 +112,9 @@ class GatewayAPI(FastAPI):
                 endpoint_configs,
                 traffic_splits,
                 route_config.routing_strategy,
+                target_names=[destination.name for destination in route_config.destinations],
+                route_name=name,
+                failover_config=route_config.failover,
             ), route_config.task_type
         raise MlflowException.invalid_parameter_value(f"Invalid endpoint / route name: '{name}'")
 
@@ -361,6 +369,27 @@ def create_app_from_config(config: GatewayConfig) -> GatewayAPI:
             status_code=404,
             detail=f"The route '{route_name}' is not present or active on the server. "
             f"Please verify the route name.",
+        )
+
+    @app.get(
+        MLFLOW_GATEWAY_CRUD_ROUTE_V3_BASE + "{route_name}/health", include_in_schema=False
+    )
+    async def get_route_target_health(route_name: str) -> RouteHealthModel:
+        """Read-only per-target health state (ejection, reason, recent failures)."""
+        route = app.traffic_routes.get(route_name)
+        if route is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"The route '{route_name}' is not present or active on the server. "
+                f"Please verify the route name.",
+            )
+
+        if route.failover is None:
+            return snapshot_disabled_route(route_name, route.destinations)
+        return snapshot_enabled_route(
+            route_name,
+            [destination.name for destination in route.destinations],
+            [destination.traffic_percentage for destination in route.destinations],
         )
 
     # TODO: Remove deployments server URLs after deprecation window elapses

@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 import pydantic
 import yaml
-from pydantic import ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import ConfigDict, ValidationError, field_validator, model_serializer, model_validator
 from pydantic.json import pydantic_encoder
 
 from mlflow.environment_variables import (
@@ -606,11 +606,73 @@ class RouteDestinationConfig(ConfigModel):
     traffic_percentage: int
 
 
+class TrafficFailoverConfig(ConfigModel):
+    """Per-route configuration for request failover and health-based ejection.
+
+    Presence of this block on a traffic route opts the route in; routes without
+    it keep the legacy direct-dispatch behavior.
+
+    Args:
+        max_failovers: Maximum number of times a single request may be
+            transferred to another destination after retryable failures.
+        failure_threshold: Number of consecutive request failures (from real
+            traffic; probe failures are counted separately) after which a
+            destination is temporarily ejected.
+        cooldown_seconds: Minimum time a destination stays ejected before
+            recovery probing begins.
+        probe_interval_seconds: Interval between lightweight recovery probes
+            while a destination is ejected.
+    """
+
+    max_failovers: int = 1
+    failure_threshold: int = 5
+    cooldown_seconds: float = 30
+    probe_interval_seconds: float = 10
+
+    @field_validator("max_failovers", mode="before")
+    @classmethod
+    def _validate_max_failovers(cls, value):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise MlflowException.invalid_parameter_value(
+                f"'max_failovers' must be a non-negative integer, got {value!r}."
+            )
+        return value
+
+    @field_validator("failure_threshold", mode="before")
+    @classmethod
+    def _validate_failure_threshold(cls, value):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise MlflowException.invalid_parameter_value(
+                f"'failure_threshold' must be a positive integer of at least 1, got {value!r}."
+            )
+        return value
+
+    @field_validator("cooldown_seconds", "probe_interval_seconds", mode="before")
+    @classmethod
+    def _validate_positive_duration(cls, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise MlflowException.invalid_parameter_value(
+                f"failover cooldown and probe interval must be positive numbers of seconds, "
+                f"got {value!r}."
+            )
+        return float(value)
+
+
 class TrafficRouteConfig(ConfigModel):
     name: str
     task_type: EndpointType
     destinations: list[RouteDestinationConfig]
     routing_strategy: Literal["TRAFFIC_SPLIT"] = "TRAFFIC_SPLIT"
+    failover: TrafficFailoverConfig | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_omit_default_failover(self, handler):
+        # Keep the route payload byte-compatible with clients when failover is
+        # not configured (omit the key entirely); configured blocks are dumped.
+        result = handler(self)
+        if self.failover is None:
+            result.pop("failover", None)
+        return result
 
 
 class EndpointModelInfo(ResponseModel):

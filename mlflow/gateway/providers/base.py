@@ -9,8 +9,13 @@ from mlflow.entities import SpanType
 from mlflow.entities.gateway_endpoint import FallbackStrategy
 from mlflow.exceptions import MlflowException
 from mlflow.gateway.base_models import ConfigModel
-from mlflow.gateway.config import EndpointConfig
+from mlflow.gateway.config import EndpointConfig, TrafficFailoverConfig
 from mlflow.gateway.exceptions import AIGatewayException
+from mlflow.gateway.health import (
+    NoHealthyTargetsError,
+    RouteHealthManager,
+    is_retryable_upstream_error,
+)
 from mlflow.gateway.schemas import chat, completions, embeddings
 from mlflow.tracing.constant import SpanAttributeKey, TokenUsageKey
 from mlflow.tracing.fluent import start_span_no_context
@@ -142,6 +147,59 @@ class BaseProvider(ABC):
         evaluation) should override this method.
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not implement get_endpoint_url")
+
+    # Config attributes that directly carry the upstream base URL for providers
+    # that do not expose a ``base_url`` / ``_api_base`` property.
+    _PROBE_URL_CONFIG_ATTRS = (
+        "openai_api_base",
+        "anthropic_api_base",
+        "gemini_api_base",
+        "mosaicml_api_base",
+        "typesafe_api_base",
+        "model_server_url",
+        "hf_server_url",
+        "api_base",
+    )
+
+    @property
+    def health_probe_url(self) -> str | None:
+        """Return the upstream URL used by the lightweight recovery probe.
+
+        Defaults to the provider's resolved base URL (including class-level
+        defaults) and falls back to well-known config attributes. Returns None
+        for providers without a generic HTTP base URL (e.g. boto3-based ones),
+        in which case ``health_probe`` is a no-op and ejection recovery falls
+        back to optimistic re-admission.
+        """
+        for attr in ("base_url", "_api_base"):
+            try:
+                value = getattr(self, attr, None)
+            except Exception:
+                value = None
+            if isinstance(value, str) and value:
+                return value
+
+        config = getattr(getattr(self.config, "model", None), "config", None)
+        for attr in self._PROBE_URL_CONFIG_ATTRS:
+            value = getattr(config, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    async def health_probe(self) -> None:
+        """Lightweight reachability probe used to recover an ejected target.
+
+        Raises on connection failures, timeouts and 5xx responses. A response
+        with any status below 500 (even 401/404) means the upstream process is
+        reachable and therefore healthy. Providers for which no generic probe
+        URL is available optimistically report health.
+        """
+        url = self.health_probe_url
+        if url is None:
+            return
+        from mlflow.gateway.providers.utils import probe_url
+
+        await probe_url(url)
 
     # -------------------------------------------------------------------------
     # Internal implementation methods (override these in subclasses)
@@ -628,7 +686,15 @@ class BaseProvider(ABC):
 
 class TrafficRouteProvider(BaseProvider):
     """
-    A provider that split traffic and forward to multiple providers
+    A provider that split traffic and forward to multiple providers.
+
+    When ``failover_config`` is supplied and the route has more than one
+    destination, retryable target failures (connection errors, timeouts and 5xx
+    responses) transfer the request to another healthy destination, targets
+    that keep failing are temporarily ejected (weights renormalize over the
+    survivors), and ejected targets are recovered via lightweight probes. With
+    no failover configuration, or with a single destination, dispatch is the
+    legacy weighted-random direct call with identical overhead and behavior.
     """
 
     DISPLAY_NAME: str = "TrafficRoute"
@@ -639,6 +705,9 @@ class TrafficRouteProvider(BaseProvider):
         traffic_splits: list[int],
         routing_strategy: str,
         enable_tracing: bool = False,
+        target_names: list[str] | None = None,
+        route_name: str = "",
+        failover_config: TrafficFailoverConfig | None = None,
     ):
         from mlflow.gateway.providers import get_provider
 
@@ -660,36 +729,119 @@ class TrafficRouteProvider(BaseProvider):
         self._weights = np.array(traffic_splits, dtype=np.float32) / np.sum(traffic_splits)
         self._indices = np.arange(len(self._providers))
         self._enable_tracing = enable_tracing
+        self._route_name = route_name
+        self._target_names = target_names or [config.name for config in configs]
+
+        # A single-destination route cannot transfer traffic anywhere, so it
+        # keeps the direct-call behavior even when failover is configured.
+        if failover_config is not None and len(self._providers) > 1:
+            self._health: RouteHealthManager | None = RouteHealthManager(
+                route_name=route_name,
+                names=self._target_names,
+                providers=self._providers,
+                weights=list(traffic_splits),
+                failover_config=failover_config,
+            )
+        else:
+            self._health = None
 
     def _get_provider(self):
         chosen_index = np.random.choice(self._indices, p=self._weights)
         return self._providers[chosen_index]
 
+    async def _call_with_failover(self, method_name: str, payload: Any) -> Any:
+        health = self._health
+        if health is None:
+            provider = self._get_provider()
+            return await getattr(provider, method_name)(payload)
+
+        attempted: set[str] = set()
+        last_error: BaseException | None = None
+        for _ in range(health.failover_config.max_failovers + 1):
+            choice = await health.select(exclude=attempted)
+            if choice is None:
+                raise NoHealthyTargetsError(self._route_name)
+            name, provider = choice
+            try:
+                result = await getattr(provider, method_name)(payload)
+            except Exception as e:
+                if not is_retryable_upstream_error(e):
+                    # Client errors (404, 422, ...) and non-availability errors
+                    # surface immediately and do not affect target health.
+                    raise
+                health.record_failure(name, e)
+                attempted.add(name)
+                last_error = e
+                continue
+            health.record_success(name)
+            return result
+
+        # Transfer budget exhausted. Only report "no available targets" when
+        # every target is actually unavailable; otherwise surface the last
+        # upstream error (e.g. max_failovers=0).
+        if await health.select(exclude=attempted) is None:
+            raise NoHealthyTargetsError(self._route_name)
+        raise last_error
+
+    async def _stream_with_failover(self, method_name: str, payload: Any) -> AsyncIterable[Any]:
+        health = self._health
+        if health is None:
+            provider = self._get_provider()
+            async for chunk in getattr(provider, method_name)(payload):
+                yield chunk
+            return
+
+        attempted: set[str] = set()
+        last_error: BaseException | None = None
+        for _ in range(health.failover_config.max_failovers + 1):
+            choice = await health.select(exclude=attempted)
+            if choice is None:
+                raise NoHealthyTargetsError(self._route_name)
+            name, provider = choice
+            yielded = False
+            try:
+                async for chunk in getattr(provider, method_name)(payload):
+                    yielded = True
+                    yield chunk
+            except Exception as e:
+                retryable = is_retryable_upstream_error(e)
+                if retryable:
+                    health.record_failure(name, e)
+                if yielded or not retryable:
+                    # Partial data has already been sent (or the error is not an
+                    # availability issue): the stream protocol is unchanged, and
+                    # a retry could only corrupt the response.
+                    raise
+                attempted.add(name)
+                last_error = e
+                continue
+            health.record_success(name)
+            return
+
+        if await health.select(exclude=attempted) is None:
+            raise NoHealthyTargetsError(self._route_name)
+        raise last_error
+
     async def chat_stream(
         self, payload: chat.RequestPayload
     ) -> AsyncIterable[chat.StreamResponsePayload]:
-        prov = self._get_provider()
-        async for i in prov.chat_stream(payload):
+        async for i in self._stream_with_failover("chat_stream", payload):
             yield i
 
     async def chat(self, payload: chat.RequestPayload) -> chat.ResponsePayload:
-        prov = self._get_provider()
-        return await prov.chat(payload)
+        return await self._call_with_failover("chat", payload)
 
     async def completions_stream(
         self, payload: completions.RequestPayload
     ) -> AsyncIterable[completions.StreamResponsePayload]:
-        prov = self._get_provider()
-        async for i in prov.completions_stream(payload):
+        async for i in self._stream_with_failover("completions_stream", payload):
             yield i
 
     async def completions(self, payload: completions.RequestPayload) -> completions.ResponsePayload:
-        prov = self._get_provider()
-        return await prov.completions(payload)
+        return await self._call_with_failover("completions", payload)
 
     async def embeddings(self, payload: embeddings.RequestPayload) -> embeddings.ResponsePayload:
-        prov = self._get_provider()
-        return await prov.embeddings(payload)
+        return await self._call_with_failover("embeddings", payload)
 
     async def passthrough(
         self,

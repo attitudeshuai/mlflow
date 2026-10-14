@@ -297,6 +297,60 @@ async def send_proxy_request(
         )
 
 
+PROBE_TIMEOUT_SECONDS = 5
+
+
+async def probe_url(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
+    ssrf_protect: bool = True,
+) -> None:
+    """Issue a lightweight HTTP probe to check whether an upstream is reachable.
+
+    Uses a ``HEAD`` request with no body. Any final HTTP response with a status
+    below 500 (including 401/403/404/405, which simply mean the unauthenticated
+    probe path does not exist) counts as reachable/healthy: the server process
+    is up. Connection failures and timeouts propagate as the underlying
+    aiohttp exceptions, and a 5xx response raises an ``HTTPException``.
+
+    Args:
+        url: The upstream base URL to probe.
+        headers: Optional headers to send with the probe.
+        timeout_seconds: Probe timeout.
+        ssrf_protect: Whether to apply the gateway's upstream SSRF protection.
+    """
+    import aiohttp
+    from fastapi import HTTPException
+
+    from mlflow.gateway.ssrf import (
+        GatewaySSRFProtectionError,
+        assert_public_upstream_url,
+        build_ssrf_guarded_connector,
+    )
+
+    connector = None
+    if ssrf_protect:
+        try:
+            assert_public_upstream_url(url)
+        except GatewaySSRFProtectionError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        connector = build_ssrf_guarded_connector()
+    try:
+        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            async with session.head(url, timeout=timeout, allow_redirects=False) as response:
+                if response.status >= 500:
+                    raise HTTPException(
+                        status_code=response.status,
+                        detail=f"Health probe of {url} reported status {response.status}",
+                    )
+    finally:
+        if connector is not None and not connector.closed:
+            await connector.close()
+
+
 def rename_payload_keys(payload: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
     """Rename payload keys based on the specified mapping. If a key is not present in the
     mapping, the key and its value will remain unchanged.
